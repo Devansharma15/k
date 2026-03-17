@@ -1,0 +1,4 @@
+AuraFlow is a next-generation AI orchestration platform designed for enterprise scale. 
+It supports multi-agent systems, real-time collaboration, and high-performance RAG pipelines.
+The platform uses FastAPI for its backend and Next.js 14 for its frontend.
+AuraFlow's primary mission is to democratize complex LLM application building for developers and businesses.
