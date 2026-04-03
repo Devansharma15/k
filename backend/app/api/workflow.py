@@ -1,12 +1,19 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import List, Dict, Any
+
+from .data import WORKFLOWS
 
 router = APIRouter()
 
 class WorkflowRun(BaseModel):
     nodes: List[Dict[str, Any]]
     edges: List[Dict[str, Any]]
+
+
+@router.get("/workflows")
+async def get_workflows():
+    return WORKFLOWS
 
 @router.post("/workflow/run")
 async def run_workflow(workflow: WorkflowRun):

@@ -1,5 +1,10 @@
-import LandingPage from "@/features/landing/components/LandingPage";
+import { AppOverview } from "@/components/AppOverview";
+import { DashboardLayout } from "@/components/DashboardLayout";
 
 export default function Home() {
-  return <LandingPage />;
+  return (
+    <DashboardLayout>
+      <AppOverview />
+    </DashboardLayout>
+  );
 }

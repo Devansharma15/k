@@ -4,19 +4,18 @@ import React, { useState, useRef, useEffect } from 'react';
 import { 
   Send, 
   Paperclip, 
-  Smile, 
   MoreHorizontal, 
   Settings,
   Database,
   Cpu,
-  RefreshCw,
   Copy,
   ThumbsUp,
   ThumbsDown
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { cn } from '@/lib/utils';
 import ReactMarkdown from 'react-markdown';
+import { apiRoutes } from '@/lib/api';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -53,7 +52,7 @@ export const ChatUI = () => {
     setIsTyping(true);
 
     try {
-      const response = await fetch('http://localhost:8000/api/chat', {
+      const response = await fetch(apiRoutes.chat, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
