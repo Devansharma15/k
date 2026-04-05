@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import ReactFlow, {
   addEdge,
   Background,
@@ -73,39 +73,50 @@ export function WorkflowCanvas({
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  useEffect(() => setNodes(initialNodes), [initialNodes, setNodes]);
-  useEffect(() => setEdges(initialEdges), [initialEdges, setEdges]);
+  const lastSyncedSnapshotRef = useRef<string>("");
 
+  // Sync prop changes -> local state (only if changed from outside)
   useEffect(() => {
-    onSnapshotChange({
-      ...snapshot,
-      nodes: nodes.map((node) => {
-        const original = snapshot.nodes.find((item) => item.id === node.id);
-        return {
-          ...(original ?? {
-            id: node.id,
-            type: "transform",
-            name: String(node.data?.label ?? "Node"),
-            config: {},
-            ai_brain: false,
-            memory: null,
-            retry_policy: { max_retries: 0, backoff: "none", retry_on: [] },
-            timeout_ms: 10000,
-          }),
-          position: node.position,
-        };
-      }),
-      edges: edges.map((edge) => {
-        const original = snapshot.edges.find((item) => item.id === edge.id);
-        return {
-          id: edge.id,
-          source: edge.source,
-          target: edge.target,
-          condition: String(original?.condition ?? edge.label ?? "true"),
-        };
-      }),
+    const snapshotStr = JSON.stringify({ nodes: snapshot.nodes, edges: snapshot.edges });
+    if (snapshotStr !== lastSyncedSnapshotRef.current) {
+      setNodes(initialNodes);
+      setEdges(initialEdges);
+      lastSyncedSnapshotRef.current = snapshotStr;
+    }
+  }, [initialNodes, initialEdges, snapshot.nodes, snapshot.edges, setNodes, setEdges]);
+
+  // Sync internal changes -> parent state
+  useEffect(() => {
+    const updatedNodes = nodes.map((node) => {
+      const nodeData = node.data as any;
+      return {
+        ...nodeData,
+        position: node.position,
+      };
     });
-  }, [edges, nodes, onSnapshotChange, snapshot]);
+
+    const updatedEdges = edges.map((edge) => {
+      return {
+        id: edge.id,
+        source: edge.source,
+        target: edge.target,
+        condition: String(edge.label ?? "true"),
+      };
+    });
+
+    const newSnapshot: WorkflowDefinition = {
+      ...snapshot,
+      nodes: updatedNodes,
+      edges: updatedEdges,
+    };
+
+    const newSnapshotStr = JSON.stringify({ nodes: newSnapshot.nodes, edges: newSnapshot.edges });
+    
+    if (newSnapshotStr !== lastSyncedSnapshotRef.current) {
+      lastSyncedSnapshotRef.current = newSnapshotStr;
+      onSnapshotChange(newSnapshot);
+    }
+  }, [nodes, edges, onSnapshotChange, snapshot]);
 
   const onConnect = useCallback(
     (params: Connection) => {

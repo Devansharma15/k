@@ -181,40 +181,329 @@ NODE_TYPES: list[dict[str, Any]] = [
         "supports_memory": False,
         "default_config": {"action": "create_issue"},
     },
+    {
+        "type": "integration_zendesk",
+        "family": "integration",
+        "label": "Zendesk Action",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "create_ticket"},
+    },
+    {
+        "type": "integration_qdrant",
+        "family": "integration",
+        "label": "Qdrant Search",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "search_vectors"},
+    },
+    {
+        "type": "integration_twitter",
+        "family": "integration",
+        "label": "Twitter Action",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "publish_post"},
+    },
+    {
+        "type": "integration_linkedin",
+        "family": "integration",
+        "label": "LinkedIn Action",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "publish_post"},
+    },
+    {
+        "type": "integration_document_parser",
+        "family": "integration",
+        "label": "Document Parser",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "parse_document"},
+    },
+    {
+        "type": "integration_accounting",
+        "family": "integration",
+        "label": "Accounting Action",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "create_entry"},
+    },
+    {
+        "type": "integration_sentry",
+        "family": "integration",
+        "label": "Sentry Trigger",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "new_alert"},
+    },
+    {
+        "type": "integration_log_fetch",
+        "family": "integration",
+        "label": "Log Fetch",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "fetch_logs"},
+    },
+    {
+        "type": "integration_shopify",
+        "family": "integration",
+        "label": "Shopify Trigger",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "new_order"},
+    },
+    {
+        "type": "integration_inventory",
+        "family": "integration",
+        "label": "Inventory Check",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "check_stock"},
+    },
+    {
+        "type": "integration_enrichment_api",
+        "family": "integration",
+        "label": "Enrichment API",
+        "supports_ai_brain": False,
+        "supports_memory": False,
+        "default_config": {"action": "enrich"},
+    },
 ]
 
 
+def _node(
+    node_id: str,
+    node_type: str,
+    name: str,
+    x: int,
+    y: int,
+    config: dict[str, Any] | None = None,
+    ai_brain: bool = False,
+    memory: str | None = None,
+    timeout_ms: int = 10000,
+) -> dict[str, Any]:
+    return {
+        "id": node_id,
+        "type": node_type,
+        "name": name,
+        "position": {"x": x, "y": y},
+        "config": config or {},
+        "ai_brain": ai_brain,
+        "memory": memory,
+        "retry_policy": {
+            "max_retries": 2,
+            "backoff": "exponential",
+            "retry_on": ["timeout", "api_error"],
+        },
+        "timeout_ms": timeout_ms,
+    }
+
+
+def _edge(edge_id: str, source: str, target: str, condition: str = "true") -> dict[str, Any]:
+    return {"id": edge_id, "source": source, "target": target, "condition": condition}
+
+
 TEMPLATES: list[dict[str, Any]] = [
-    {"name": "Send Email on Form Submit", "category": "Basic", "difficulty": "basic"},
-    {"name": "Slack Notification Bot", "category": "Basic", "difficulty": "basic"},
-    {"name": "Auto Reply Bot", "category": "Basic", "difficulty": "basic"},
-    {"name": "Webhook to Notion", "category": "Basic", "difficulty": "basic"},
-    {"name": "Daily Standup Reminder", "category": "Basic", "difficulty": "basic"},
-    {"name": "Stripe Payment Alert", "category": "Basic", "difficulty": "basic"},
-    {"name": "Gmail Label Router", "category": "Basic", "difficulty": "basic"},
-    {"name": "Form Lead Capture", "category": "Basic", "difficulty": "basic"},
-    {"name": "Telegram Alert Flow", "category": "Basic", "difficulty": "basic"},
-    {"name": "Calendar Reminder", "category": "Basic", "difficulty": "basic"},
-    {"name": "CRM Lead Sync", "category": "Medium", "difficulty": "medium"},
-    {"name": "Social Media Auto Post", "category": "Medium", "difficulty": "medium"},
-    {"name": "Email Campaign Automation", "category": "Medium", "difficulty": "medium"},
-    {"name": "Support Ticket Escalation", "category": "Medium", "difficulty": "medium"},
-    {"name": "Invoice Approval Flow", "category": "Medium", "difficulty": "medium"},
-    {"name": "Marketing Lead Enrichment", "category": "Medium", "difficulty": "medium"},
-    {"name": "Sales Follow-up Sequence", "category": "Medium", "difficulty": "medium"},
-    {"name": "GitHub Issue to Slack", "category": "Medium", "difficulty": "medium"},
-    {"name": "Blog Publish Workflow", "category": "Medium", "difficulty": "medium"},
-    {"name": "Document Review Pipeline", "category": "Medium", "difficulty": "medium"},
-    {"name": "AI Customer Support Agent", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "RAG-based Chatbot", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "Multi-step Approval Workflow", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "Incident Response Copilot", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "AI Lead Qualification Agent", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "Meeting Notes to Tasks Agent", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "Procurement Routing Agent", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "Fraud Review Workflow", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "Contract Intake Agent", "category": "Advanced", "difficulty": "advanced"},
-    {"name": "Data Pipeline Automation", "category": "Advanced", "difficulty": "advanced"},
+    {
+        "id": "tpl_ai_customer_support",
+        "name": "AI Customer Support Agent (Multi-channel)",
+        "category": "Operations",
+        "difficulty": "advanced",
+        "description": "Classifies inbound support requests and auto-replies simple cases while escalating complex ones.",
+        "integrations_required": ["gmail", "zendesk", "slack"],
+        "nodes": [
+            _node("n1", "integration_gmail", "Gmail Trigger", 80, 180, {"action": "new_message"}),
+            _node("n2", "llm_classify", "Intent + Sentiment", 340, 180, {"prompt": "Classify support intent and sentiment."}, True, "short_term", 30000),
+            _node("n3", "condition", "Simple Request?", 600, 180, {"expression": "True"}),
+            _node("n4", "llm_generate", "Generate Reply", 860, 100, {"prompt": "Draft a concise support reply."}, True, "short_term", 30000),
+            _node("n5", "integration_zendesk", "Create Zendesk Ticket", 860, 260, {"action": "create_ticket"}),
+            _node("n6", "integration_slack", "Notify Human Team", 1120, 260, {"action": "send_message"}),
+        ],
+        "edges": [
+            _edge("e1", "n1", "n2"),
+            _edge("e2", "n2", "n3"),
+            _edge("e3", "n3", "n4", "result.get('result') == True"),
+            _edge("e4", "n3", "n5", "result.get('result') == False"),
+            _edge("e5", "n5", "n6"),
+        ],
+    },
+    {
+        "id": "tpl_fraud_detection_payment_review",
+        "name": "Fraud Detection & Payment Review System",
+        "category": "Risk",
+        "difficulty": "advanced",
+        "description": "Scores payment risk and routes suspicious transactions through human approval.",
+        "integrations_required": ["stripe", "slack"],
+        "nodes": [
+            _node("n1", "integration_stripe", "Stripe Payment Trigger", 80, 180, {"action": "payment_received"}),
+            _node("n2", "llm_decision", "LLM Risk Scoring", 340, 180, {"prompt": "Score payment risk from 0 to 1 with explanation."}, True, "short_term", 30000),
+            _node("n3", "condition", "Risk > Threshold", 600, 180, {"expression": "True"}),
+            _node("n4", "integration_slack", "Alert Fraud Channel", 860, 120, {"action": "send_message"}),
+            _node("n5", "human_approval", "Human Payment Review", 1120, 120, {"message": "Approve flagged payment?"}),
+        ],
+        "edges": [
+            _edge("e1", "n1", "n2"),
+            _edge("e2", "n2", "n3"),
+            _edge("e3", "n3", "n4", "result.get('result') == True"),
+            _edge("e4", "n4", "n5"),
+        ],
+    },
+    {
+        "id": "tpl_ai_lead_qualification",
+        "name": "AI Lead Qualification + CRM Routing",
+        "category": "Sales",
+        "difficulty": "advanced",
+        "description": "Enriches inbound leads, scores quality, and routes qualified leads to CRM and sales alerts.",
+        "integrations_required": ["hubspot", "slack"],
+        "nodes": [
+            _node("n1", "trigger_webhook", "Lead Form Trigger", 80, 180, {"path": "/webhooks/new-lead"}),
+            _node("n2", "integration_enrichment_api", "Lead Enrichment API", 340, 180, {"action": "enrich"}),
+            _node("n3", "llm_classify", "Lead Quality Scoring", 600, 180, {"prompt": "Score lead quality and summarize fit."}, True, "short_term", 30000),
+            _node("n4", "condition", "Qualified Lead?", 860, 180, {"expression": "True"}),
+            _node("n5", "integration_hubspot", "Update HubSpot", 1120, 120, {"action": "create_or_update_contact"}),
+            _node("n6", "integration_slack", "Notify Sales Team", 1120, 260, {"action": "send_message"}),
+        ],
+        "edges": [
+            _edge("e1", "n1", "n2"),
+            _edge("e2", "n2", "n3"),
+            _edge("e3", "n3", "n4"),
+            _edge("e4", "n4", "n5", "result.get('result') == True"),
+            _edge("e5", "n5", "n6"),
+        ],
+    },
+    {
+        "id": "tpl_rag_internal_knowledge_assistant",
+        "name": "RAG-based Internal Knowledge Assistant",
+        "category": "AI",
+        "difficulty": "advanced",
+        "description": "Accepts user queries, retrieves relevant knowledge chunks, and responds with context-aware answers.",
+        "integrations_required": ["qdrant"],
+        "nodes": [
+            _node("n1", "trigger_webhook", "Chat Query Input", 80, 180, {"path": "/webhooks/internal-kb-query"}),
+            _node("n2", "integration_qdrant", "Vector Search (Qdrant)", 340, 180, {"action": "search_vectors"}),
+            _node("n3", "llm_generate", "Generate Contextual Answer", 600, 180, {"prompt": "Answer using retrieved context only."}, True, "dataset_ref", 30000),
+            _node("n4", "transform", "Return Response", 860, 180, {"template": "{{input}}"}),
+        ],
+        "edges": [_edge("e1", "n1", "n2"), _edge("e2", "n2", "n3"), _edge("e3", "n3", "n4")],
+    },
+    {
+        "id": "tpl_social_media_content_engine",
+        "name": "AI Social Media Content Engine",
+        "category": "Marketing",
+        "difficulty": "medium",
+        "description": "Generates daily social content, transforms copy per platform, and auto-posts to channels.",
+        "integrations_required": ["twitter", "linkedin"],
+        "nodes": [
+            _node("n1", "trigger_schedule", "Daily Scheduler", 80, 180, {"cron": "0 9 * * *"}),
+            _node("n2", "llm_generate", "Generate Content Draft", 340, 180, {"prompt": "Write social media copy for today."}, True, "short_term", 30000),
+            _node("n3", "transform", "Adapt per Platform", 600, 180, {"template": "{{input}}"}),
+            _node("n4", "integration_twitter", "Post to Twitter", 860, 120, {"action": "publish_post"}),
+            _node("n5", "integration_linkedin", "Post to LinkedIn", 860, 260, {"action": "publish_post"}),
+        ],
+        "edges": [_edge("e1", "n1", "n2"), _edge("e2", "n2", "n3"), _edge("e3", "n3", "n4"), _edge("e4", "n3", "n5")],
+    },
+    {
+        "id": "tpl_smart_invoice_processing",
+        "name": "Smart Invoice Processing & Approval",
+        "category": "Finance",
+        "difficulty": "advanced",
+        "description": "Parses uploaded invoices, validates extracted fields with AI, and routes approved entries to accounting.",
+        "integrations_required": ["accounting"],
+        "nodes": [
+            _node("n1", "trigger_webhook", "Invoice Upload", 80, 180, {"path": "/webhooks/invoice-upload"}),
+            _node("n2", "integration_document_parser", "OCR / Parser", 340, 180, {"action": "extract_fields"}),
+            _node("n3", "llm_decision", "LLM Validation", 600, 180, {"prompt": "Validate invoice fields and flag issues."}, True, "short_term", 30000),
+            _node("n4", "condition", "Valid Invoice?", 860, 180, {"expression": "True"}),
+            _node("n5", "human_approval", "Finance Approval", 1120, 120, {"message": "Approve invoice for posting?"}),
+            _node("n6", "integration_accounting", "Accounting Update", 1380, 120, {"action": "create_entry"}),
+        ],
+        "edges": [
+            _edge("e1", "n1", "n2"),
+            _edge("e2", "n2", "n3"),
+            _edge("e3", "n3", "n4"),
+            _edge("e4", "n4", "n5", "result.get('result') == True"),
+            _edge("e5", "n5", "n6"),
+        ],
+    },
+    {
+        "id": "tpl_devops_incident_copilot",
+        "name": "DevOps Incident Response Copilot",
+        "category": "Engineering",
+        "difficulty": "advanced",
+        "description": "Analyzes incident alerts, summarizes probable root causes, and opens action items for engineers.",
+        "integrations_required": ["sentry", "slack", "github"],
+        "nodes": [
+            _node("n1", "integration_sentry", "Sentry Trigger", 80, 180, {"action": "new_alert"}),
+            _node("n2", "integration_log_fetch", "Fetch Logs", 340, 180, {"action": "fetch_logs"}),
+            _node("n3", "llm_generate", "LLM Incident Analysis", 600, 180, {"prompt": "Analyze incident logs and suggest fixes."}, True, "short_term", 30000),
+            _node("n4", "integration_slack", "Notify Incident Channel", 860, 120, {"action": "send_message"}),
+            _node("n5", "integration_github", "Create GitHub Issue", 860, 260, {"action": "create_issue"}),
+        ],
+        "edges": [_edge("e1", "n1", "n2"), _edge("e2", "n2", "n3"), _edge("e3", "n3", "n4"), _edge("e4", "n3", "n5")],
+    },
+    {
+        "id": "tpl_ecommerce_order_manager",
+        "name": "E-commerce Smart Order Manager",
+        "category": "Commerce",
+        "difficulty": "advanced",
+        "description": "Evaluates incoming orders for stock, fraud risk, and fulfillment priority with AI-assisted branching.",
+        "integrations_required": ["shopify", "slack", "gmail"],
+        "nodes": [
+            _node("n1", "integration_shopify", "Shopify Order Trigger", 80, 180, {"action": "new_order"}),
+            _node("n2", "integration_inventory", "Inventory Check", 340, 180, {"action": "check_stock"}),
+            _node("n3", "llm_decision", "LLM Priority Decision", 600, 180, {"prompt": "Determine fulfillment priority and fraud confidence."}, True, "short_term", 30000),
+            _node("n4", "condition", "Priority Fulfillment?", 860, 180, {"expression": "True"}),
+            _node("n5", "integration_gmail", "Notify by Email", 1120, 120, {"action": "send_email"}),
+            _node("n6", "integration_slack", "Notify Ops Slack", 1120, 260, {"action": "send_message"}),
+        ],
+        "edges": [
+            _edge("e1", "n1", "n2"),
+            _edge("e2", "n2", "n3"),
+            _edge("e3", "n3", "n4"),
+            _edge("e4", "n4", "n5", "result.get('result') == True"),
+            _edge("e5", "n4", "n6", "result.get('result') == False"),
+        ],
+    },
+    {
+        "id": "tpl_meeting_notes_to_tasks",
+        "name": "AI Meeting Notes -> Task Automation",
+        "category": "Productivity",
+        "difficulty": "medium",
+        "description": "Converts meeting transcripts into actionable task lists and publishes assignments to collaboration tools.",
+        "integrations_required": ["notion", "slack"],
+        "nodes": [
+            _node("n1", "trigger_webhook", "Transcript Input", 80, 180, {"path": "/webhooks/meeting-transcript"}),
+            _node("n2", "llm_generate", "Meeting Summary", 340, 180, {"prompt": "Summarize key meeting outcomes."}, True, "short_term", 30000),
+            _node("n3", "llm_classify", "Task Extraction", 600, 180, {"prompt": "Extract tasks, owners, and due dates."}, True, "short_term", 30000),
+            _node("n4", "integration_notion", "Create Notion Tasks", 860, 120, {"action": "create_page"}),
+            _node("n5", "integration_slack", "Notify Task Owners", 860, 260, {"action": "send_message"}),
+        ],
+        "edges": [_edge("e1", "n1", "n2"), _edge("e2", "n2", "n3"), _edge("e3", "n3", "n4"), _edge("e4", "n3", "n5")],
+    },
+    {
+        "id": "tpl_multistep_approval_engine",
+        "name": "Multi-step Approval Workflow Engine",
+        "category": "Governance",
+        "difficulty": "advanced",
+        "description": "Scores request priority with AI and routes the request through sequential approval stages before final action.",
+        "integrations_required": ["slack"],
+        "nodes": [
+            _node("n1", "trigger_webhook", "Request Trigger", 80, 180, {"path": "/webhooks/approval-request"}),
+            _node("n2", "llm_decision", "Priority Scoring", 340, 180, {"prompt": "Score request urgency and business impact."}, True, "short_term", 30000),
+            _node("n3", "human_approval", "Manager Approval", 600, 120, {"message": "Manager approval required."}),
+            _node("n4", "human_approval", "Director Approval", 860, 120, {"message": "Director approval required."}),
+            _node("n5", "condition", "Final Decision", 1120, 120, {"expression": "True"}),
+            _node("n6", "integration_slack", "Final Action Notify", 1380, 120, {"action": "send_message"}),
+        ],
+        "edges": [
+            _edge("e1", "n1", "n2"),
+            _edge("e2", "n2", "n3"),
+            _edge("e3", "n3", "n4"),
+            _edge("e4", "n4", "n5"),
+            _edge("e5", "n5", "n6", "result.get('result') == True"),
+        ],
+    },
 ]
 
 
@@ -330,12 +619,21 @@ class WorkflowPlatformService:
 
     def _seed_templates(self) -> None:
         with self._connect() as connection:
-            existing = connection.execute("SELECT COUNT(*) AS total FROM templates").fetchone()["total"]
-            if existing >= 30:
+            existing_rows = connection.execute(
+                "SELECT id, name FROM templates ORDER BY id"
+            ).fetchall()
+            expected_names = [template["name"] for template in TEMPLATES]
+            existing_names = [row["name"] for row in existing_rows]
+            if len(existing_rows) == len(TEMPLATES) and set(existing_names) == set(expected_names):
                 return
+
             connection.execute("DELETE FROM templates")
-            for index, template in enumerate(TEMPLATES, start=1):
-                workflow_snapshot = self._template_snapshot(template["name"], index)
+            for template in TEMPLATES:
+                workflow_snapshot = {
+                    "name": template["name"],
+                    "nodes": template["nodes"],
+                    "edges": template["edges"],
+                }
                 connection.execute(
                     """
                     INSERT INTO templates (
@@ -344,68 +642,15 @@ class WorkflowPlatformService:
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        f"tpl_{index:02d}",
+                        template["id"],
                         template["name"],
                         template["category"],
                         template["difficulty"],
-                        f"{template['name']} starter workflow for AuraFlow.",
-                        json.dumps(self._template_integrations(template["name"])),
+                        template["description"],
+                        json.dumps(template["integrations_required"]),
                         json.dumps(workflow_snapshot),
                     ),
                 )
-
-    def _template_snapshot(self, name: str, index: int) -> dict[str, Any]:
-        slug = name.lower().replace(" ", "-")
-        nodes = [
-            {
-                "id": f"trigger-{index}",
-                "type": "trigger_webhook",
-                "name": f"{name} Trigger",
-                "position": {"x": 80, "y": 140},
-                "config": {"path": f"/webhooks/{slug}"},
-                "ai_brain": False,
-                "memory": None,
-                "retry_policy": {"max_retries": 0, "backoff": "none", "retry_on": []},
-                "timeout_ms": 5000,
-            },
-            {
-                "id": f"action-{index}",
-                "type": "transform",
-                "name": f"{name} Handler",
-                "position": {"x": 380, "y": 140},
-                "config": {"template": "{{input}}"},
-                "ai_brain": False,
-                "memory": None,
-                "retry_policy": {"max_retries": 1, "backoff": "exponential", "retry_on": ["timeout"]},
-                "timeout_ms": 10000,
-            },
-        ]
-        edges = [
-            {
-                "id": f"edge-{index}",
-                "source": nodes[0]["id"],
-                "target": nodes[1]["id"],
-                "condition": "true",
-            }
-        ]
-        return {
-            "name": name,
-            "nodes": nodes,
-            "edges": edges,
-        }
-
-    def _template_integrations(self, name: str) -> list[str]:
-        mapping = {
-            "Slack": ["slack"],
-            "Email": ["gmail"],
-            "GitHub": ["github"],
-            "CRM": ["hubspot"],
-        }
-        result = []
-        for key, integrations in mapping.items():
-            if key.lower() in name.lower():
-                result.extend(integrations)
-        return result
 
     def list_workflows(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
