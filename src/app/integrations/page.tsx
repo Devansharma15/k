@@ -32,8 +32,8 @@ export default function IntegrationsPage() {
               </h1>
               <p className="mt-4 text-base leading-7 text-muted-foreground">
                 AuraFlow now has a dedicated integration control room with
-                encrypted API-key storage, OAuth handoff support, and reusable
-                connection references for future workflow nodes.
+                encrypted API-key storage, session-based OAuth via Nango, and
+                reusable connection references for workflow nodes.
               </p>
             </div>
 
@@ -154,12 +154,13 @@ export default function IntegrationsPage() {
           <FeatureCard
             icon={<Sparkles className="h-5 w-5 text-amber-400" />}
             title="Fast setup"
-            body="Use direct API keys or hand off OAuth through a configured Nango flow."
+            body="Choose direct API keys or launch a session-based OAuth popup through Nango."
           />
         </section>
       </div>
 
       <IntegrationModal
+        key={selectedProvider?.slug ?? "closed"}
         provider={selectedProvider}
         open={Boolean(selectedProvider)}
         onClose={() => setSelectedProvider(null)}

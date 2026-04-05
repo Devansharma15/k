@@ -10,6 +10,9 @@ import ReactFlow, {
   type Connection,
   type Edge,
   type Node,
+  type NodeChange,
+  type EdgeChange,
+  type ReactFlowInstance,
   useEdgesState,
   useNodesState,
 } from "reactflow";
@@ -25,14 +28,45 @@ interface WorkflowCanvasProps {
   nodeTypesCatalog: WorkflowNodeType[];
   onSnapshotChange: (snapshot: WorkflowDefinition) => void;
   onSelectNode?: (nodeId: string | null) => void;
+  isEditable?: boolean;
+  nodeStatuses?: Record<string, string>;
+  nodeWarnings?: Record<string, string[]>;
 }
+
+type CanvasNodeData = {
+  id: string;
+  type: string;
+  name: string;
+  config: Record<string, unknown>;
+  input_mapping?: Record<string, string>;
+  output_mapping?: Record<string, string>;
+  ai_brain: boolean;
+  memory: "short_term" | "long_term" | "dataset_ref" | null;
+  retry_policy: {
+    max_retries: number;
+    backoff: string;
+    retry_on: string[];
+  };
+  timeout_ms: number;
+  label?: string;
+  family?: string;
+  summary?: string;
+  status?: string;
+  warnings?: string[];
+};
 
 export function WorkflowCanvas({
   snapshot,
   nodeTypesCatalog,
   onSnapshotChange,
   onSelectNode,
+  isEditable = true,
+  nodeStatuses = {},
+  nodeWarnings = {},
 }: WorkflowCanvasProps) {
+  const flowWrapperRef = useRef<HTMLDivElement | null>(null);
+  const rfInstanceRef = useRef<ReactFlowInstance | null>(null);
+
   const initialNodes = useMemo<Node[]>(
     () =>
       snapshot.nodes.map((node) => {
@@ -51,10 +85,12 @@ export function WorkflowCanvas({
                 : typeof node.config.expression === "string"
                   ? node.config.expression
                   : `${node.name} configuration`,
+            status: nodeStatuses[node.id] ?? "idle",
+            warnings: nodeWarnings[node.id] ?? [],
           },
         };
       }),
-    [snapshot.nodes, nodeTypesCatalog],
+    [snapshot.nodes, nodeTypesCatalog, nodeStatuses, nodeWarnings],
   );
 
   const initialEdges = useMemo<Edge[]>(
@@ -88,10 +124,20 @@ export function WorkflowCanvas({
   // Sync internal changes -> parent state
   useEffect(() => {
     const updatedNodes = nodes.map((node) => {
-      const nodeData = node.data as any;
+      const nodeData = node.data as CanvasNodeData;
       return {
-        ...nodeData,
+        id: nodeData.id ?? node.id,
+        type: nodeData.type,
+        name: nodeData.name ?? nodeData.label ?? "Node",
         position: node.position,
+        config: nodeData.config ?? {},
+        input_mapping: nodeData.input_mapping ?? {},
+        output_mapping: nodeData.output_mapping ?? {},
+        ai_brain: Boolean(nodeData.ai_brain),
+        memory: nodeData.memory ?? null,
+        retry_policy:
+          nodeData.retry_policy ?? { max_retries: 0, backoff: "none", retry_on: [] },
+        timeout_ms: Number(nodeData.timeout_ms ?? 10000),
       };
     });
 
@@ -120,6 +166,7 @@ export function WorkflowCanvas({
 
   const onConnect = useCallback(
     (params: Connection) => {
+      if (!isEditable) return;
       setEdges((current) =>
         addEdge(
           {
@@ -133,21 +180,104 @@ export function WorkflowCanvas({
         ),
       );
     },
-    [setEdges],
+    [isEditable, setEdges],
+  );
+
+  const handleNodesChange = useCallback(
+    (changes: NodeChange[]) => {
+      if (!isEditable) return;
+      onNodesChange(changes);
+    },
+    [isEditable, onNodesChange],
+  );
+
+  const handleEdgesChange = useCallback(
+    (changes: EdgeChange[]) => {
+      if (!isEditable) return;
+      onEdgesChange(changes);
+    },
+    [isEditable, onEdgesChange],
+  );
+
+  const onDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!isEditable) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+    },
+    [isEditable],
+  );
+
+  const onDrop = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!isEditable) return;
+      event.preventDefault();
+      const nodeType = event.dataTransfer.getData("application/auraflow-node-type");
+      if (!nodeType) return;
+      const catalog = nodeTypesCatalog.find((item) => item.type === nodeType);
+      if (!catalog) return;
+      const wrapperRect = flowWrapperRef.current?.getBoundingClientRect();
+      const rawPosition = {
+        x: event.clientX - (wrapperRect?.left ?? 0),
+        y: event.clientY - (wrapperRect?.top ?? 0),
+      };
+      const flowPosition = rfInstanceRef.current?.screenToFlowPosition
+        ? rfInstanceRef.current.screenToFlowPosition({
+            x: event.clientX,
+            y: event.clientY,
+          })
+        : rawPosition;
+      const newNodeId = `${catalog.type}-${crypto.randomUUID()}`;
+      const newNode: Node = {
+        id: newNodeId,
+        type: "platform",
+        position: flowPosition,
+        data: {
+          id: newNodeId,
+          type: catalog.type,
+          name: catalog.label,
+          label: catalog.label,
+          family: catalog.family,
+          config: { ...(catalog.default_config ?? {}) },
+          input_mapping: {},
+          output_mapping: {},
+          ai_brain: catalog.supports_ai_brain,
+          memory: catalog.supports_memory ? "short_term" : null,
+          retry_policy: { max_retries: 1, backoff: "exponential", retry_on: ["api_error"] },
+          timeout_ms: catalog.family === "ai" ? 30000 : 10000,
+          summary: `${catalog.label} configuration`,
+          status: "idle",
+          warnings: [],
+        },
+      };
+      setNodes((current) => [...current, newNode]);
+    },
+    [isEditable, nodeTypesCatalog, setNodes],
   );
 
   return (
-    <div className="relative h-full w-full overflow-hidden rounded-[2rem] border border-border bg-background">
+    <div
+      ref={flowWrapperRef}
+      className="relative h-full w-full overflow-hidden rounded-[2rem] border border-border bg-background"
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+    >
       <ReactFlow
         nodes={nodes}
         edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
+        onNodesChange={handleNodesChange}
+        onEdgesChange={handleEdgesChange}
         onConnect={onConnect}
         onPaneClick={() => onSelectNode?.(null)}
         onNodeClick={(_, node) => onSelectNode?.(node.id)}
         nodeTypes={{ platform: PlatformNode }}
         fitView
+        onInit={(instance) => {
+          rfInstanceRef.current = instance;
+        }}
+        nodesDraggable={isEditable}
+        nodesConnectable={isEditable}
+        elementsSelectable
         className="bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.04),_transparent_40%),linear-gradient(180deg,rgba(2,6,23,0.55),rgba(2,6,23,0.9))]"
       >
         <Background color="#334155" gap={24} variant={BackgroundVariant.Dots} />
@@ -166,9 +296,22 @@ export function WorkflowCanvas({
         />
       </ReactFlow>
 
+      {nodes.length === 0 ? (
+        <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center">
+          <div className="glass max-w-md rounded-2xl border border-border px-6 py-5 text-center">
+            <p className="text-base font-semibold text-foreground">
+              Drag nodes or generate with AI
+            </p>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Open the palette and drop nodes on the canvas, or use the prompt bar to generate a workflow.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
       <div className="pointer-events-none absolute left-5 top-5 z-10">
         <div className="glass rounded-2xl px-4 py-3 text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-          Live canvas editor
+          {isEditable ? "Live canvas editor" : "Workflow locked while run is active"}
         </div>
       </div>
 

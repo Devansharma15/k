@@ -67,6 +67,13 @@ export interface IntegrationConnection {
   status: string;
 }
 
+export interface IntegrationStatusResponse {
+  provider: string;
+  status: "pending" | "connected" | "failed" | "revoked" | "not_connected";
+  connection_id: string | null;
+  connection_ref: string | null;
+}
+
 export interface IntegrationsResponse {
   summary: {
     total: number;
@@ -84,10 +91,11 @@ export interface EnvDetectResponse {
   masked_key: string | null;
 }
 
-export interface ApiKeyConnectResponse extends IntegrationConnection {}
+export type ApiKeyConnectResponse = IntegrationConnection;
 
-export interface OAuthConnectResponse extends IntegrationConnection {
-  auth_url: string;
+export interface OAuthSessionResponse extends IntegrationConnection {
+  status: string;
+  connect_session_token: string;
 }
 
 export interface KnowledgeBaseDataset {
@@ -188,6 +196,8 @@ export interface WorkflowNodeDefinition {
   name: string;
   position: { x: number; y: number };
   config: Record<string, unknown>;
+  input_mapping?: Record<string, string>;
+  output_mapping?: Record<string, string>;
   ai_brain: boolean;
   memory: "short_term" | "long_term" | "dataset_ref" | null;
   retry_policy: WorkflowRetryPolicy;
@@ -226,6 +236,9 @@ export interface WorkflowPlatformRecord {
   updated_at: string;
   created_by: string;
   updated_by: string;
+  is_locked?: boolean;
+  active_run_id?: string | null;
+  active_run_status?: string | null;
   versions: WorkflowVersionRecord[];
   latest_version?: number | null;
   run_count?: number;
@@ -262,6 +275,7 @@ export interface WorkflowRunRecord {
   debug: number;
   parent_run_id: string | null;
   status: string;
+  input_payload?: Record<string, unknown>;
   initial_input: Record<string, unknown>;
   context_snapshot: Record<string, unknown>;
   final_output: Record<string, unknown> | null;
@@ -278,6 +292,27 @@ export interface WorkflowNodeType {
   supports_ai_brain: boolean;
   supports_memory: boolean;
   default_config: Record<string, unknown>;
+  config_schema?: Record<string, { type?: string; required?: boolean }>;
+  required_fields?: string[];
+  secrets_required?: string[];
+}
+
+export interface WorkflowRunLog {
+  node_id: string;
+  status: string;
+  message: string;
+  timestamp: string;
+  attempt: number;
+}
+
+export interface WorkflowRunLogsResponse {
+  run_id: string;
+  workflow_id: string;
+  status: string;
+  input_payload: Record<string, unknown>;
+  context_snapshot: Record<string, unknown>;
+  final_output: Record<string, unknown> | null;
+  logs: WorkflowRunLog[];
 }
 
 export interface WorkflowTemplate {
@@ -324,6 +359,9 @@ export const apiRoutes = {
   overview: `${API_BASE_URL}/api/overview`,
   chat: `${API_BASE_URL}/api/chat`,
   integrations: `${API_BASE_URL}/api/integrations`,
+  integrationStatus: `${API_BASE_URL}/api/integrations/status`,
+  saveIntegrationApiKey: `${API_BASE_URL}/api/integrations/save-api-key`,
+  createIntegrationSession: `${API_BASE_URL}/api/integrations/create-session`,
   connectApiKey: `${API_BASE_URL}/api/connect/api-key`,
   connectOAuth: `${API_BASE_URL}/api/connect/oauth`,
   detectEnv: `${API_BASE_URL}/api/connect/env-detect`,
@@ -370,6 +408,30 @@ async function postJson<TResponse>(
   return (await response.json()) as TResponse;
 }
 
+async function postJsonWithFallback<TResponse>(
+  urls: string[],
+  body: Record<string, unknown>,
+): Promise<TResponse> {
+  let lastError: Error | null = null;
+
+  for (const url of urls) {
+    try {
+      return await postJson<TResponse>(url, body);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.message === "Request failed." || error.message === "Not Found")
+      ) {
+        lastError = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastError ?? new Error("Request failed.");
+}
+
 export async function getIntegrations(): Promise<IntegrationsResponse> {
   const response = await fetch(apiRoutes.integrations);
 
@@ -378,6 +440,23 @@ export async function getIntegrations(): Promise<IntegrationsResponse> {
   }
 
   return (await response.json()) as IntegrationsResponse;
+}
+
+export async function getIntegrationStatus(
+  provider: string,
+): Promise<IntegrationStatusResponse> {
+  const response = await fetch(
+    `${apiRoutes.integrationStatus}?provider=${encodeURIComponent(provider)}`,
+  );
+
+  if (!response.ok) {
+    const errorBody = (await response.json().catch(() => null)) as
+      | { detail?: string }
+      | null;
+    throw new Error(errorBody?.detail ?? "Failed to load integration status.");
+  }
+
+  return (await response.json()) as IntegrationStatusResponse;
 }
 
 export async function detectIntegrationEnv(
@@ -390,20 +469,44 @@ export async function connectIntegrationApiKey(
   provider: string,
   apiKey: string,
 ): Promise<ApiKeyConnectResponse> {
-  return postJson<ApiKeyConnectResponse>(apiRoutes.connectApiKey, {
-    provider,
-    api_key: apiKey,
-    user_id: "demo-user",
-  });
+  return postJsonWithFallback<ApiKeyConnectResponse>(
+    [apiRoutes.saveIntegrationApiKey, apiRoutes.connectApiKey],
+    {
+      provider,
+      api_key: apiKey,
+      user_id: "demo-user",
+    },
+  );
 }
 
-export async function connectIntegrationOAuth(
+export async function createIntegrationSession(
   provider: string,
-): Promise<OAuthConnectResponse> {
-  return postJson<OAuthConnectResponse>(apiRoutes.connectOAuth, {
-    provider,
-    user_id: "demo-user",
-  });
+): Promise<OAuthSessionResponse> {
+  return postJsonWithFallback<OAuthSessionResponse>(
+    [apiRoutes.createIntegrationSession, apiRoutes.connectOAuth],
+    {
+      provider,
+      user_id: "demo-user",
+    },
+  );
+}
+
+export async function disconnectIntegration(
+  provider: string,
+): Promise<{ provider: string; disconnected: boolean }> {
+  const response = await fetch(
+    `${apiRoutes.integrations}/${encodeURIComponent(provider)}`,
+    {
+      method: "DELETE",
+    },
+  );
+  if (!response.ok) {
+    const errorBody = (await response.json().catch(() => null)) as
+      | { detail?: string }
+      | null;
+    throw new Error(errorBody?.detail ?? "Disconnect failed.");
+  }
+  return (await response.json()) as { provider: string; disconnected: boolean };
 }
 
 export async function getKnowledgeBaseDatasets(): Promise<KnowledgeBaseDatasetsResponse> {
@@ -541,7 +644,12 @@ export async function validatePlatformWorkflow(
   workflowId: string,
   name: string,
   snapshot: WorkflowDefinition,
-): Promise<{ valid: boolean; nodes: number; edges: number }> {
+): Promise<{
+  valid: boolean;
+  nodes: number;
+  edges: number;
+  errors?: Array<{ node_id: string; message: string }>;
+}> {
   return postJson(`${apiRoutes.workflowPlatform}/${workflowId}/validate`, {
     name,
     snapshot,
@@ -596,6 +704,22 @@ export async function getPlatformRun(
     throw new Error("Failed to load workflow run.");
   }
   return (await response.json()) as WorkflowRunRecord;
+}
+
+export async function getPlatformRunLogs(
+  workflowId: string,
+  runId: string,
+): Promise<WorkflowRunLogsResponse | null> {
+  const response = await fetch(
+    `${apiRoutes.workflowPlatform}/${workflowId}/runs/${runId}/logs`,
+  );
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error("Failed to load workflow logs.");
+  }
+  return (await response.json()) as WorkflowRunLogsResponse;
 }
 
 export async function listPlatformVersions(

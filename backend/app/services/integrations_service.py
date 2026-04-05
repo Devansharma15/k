@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
 import sqlite3
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 
 class IntegrationConfigError(RuntimeError):
+    pass
+
+
+class IntegrationAuthError(RuntimeError):
+    pass
+
+
+class IntegrationRateLimitError(RuntimeError):
     pass
 
 
@@ -229,6 +244,24 @@ INTEGRATION_CATALOG = [
     },
 ]
 
+DEFAULT_USER_ID = "demo-user"
+RATE_LIMIT_WINDOW_SECONDS = 10
+RATE_LIMIT_MAX_ATTEMPTS = 3
+
+NANGO_PROVIDER_MAP = {
+    "slack": "slack",
+    "gmail": "google-mail",
+    "notion": "notion",
+    "google-sheets": "google-sheets",
+    "hubspot": "hubspot",
+    "github": "github",
+    "zendesk": "zendesk",
+    "intercom": "intercom",
+    "linear": "linear",
+    "vercel": "vercel",
+    "shopify": "shopify",
+}
+
 
 class IntegrationsService:
     def __init__(self) -> None:
@@ -243,6 +276,7 @@ class IntegrationsService:
             for category in INTEGRATION_CATALOG
             for provider in category["providers"]
         }
+        self._session_rate_limits: dict[str, list[float]] = {}
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -269,6 +303,20 @@ class IntegrationsService:
                 )
                 """
             )
+            existing_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(integration_connections)")
+            }
+            if "connection_id" not in existing_columns:
+                connection.execute(
+                    "ALTER TABLE integration_connections ADD COLUMN connection_id TEXT"
+                )
+            connection.execute(
+                """
+                UPDATE integration_connections
+                SET connection_id = COALESCE(connection_id, connection_ref)
+                """
+            )
 
     def _get_provider(self, provider: str) -> dict[str, Any]:
         slug = _slugify(provider)
@@ -276,6 +324,26 @@ class IntegrationsService:
         if not config:
             raise ValueError(f"Unknown integration provider: {provider}")
         return config
+
+    def _resolve_user_id(self, requested_user_id: str | None = None) -> str:
+        if requested_user_id and requested_user_id != DEFAULT_USER_ID:
+            raise IntegrationAuthError("You cannot operate on another user's integrations.")
+        return DEFAULT_USER_ID
+
+    def _enforce_session_rate_limit(self, user_id: str, provider: str) -> None:
+        key = f"{user_id}:{provider}"
+        now = time.time()
+        bucket = [
+            timestamp
+            for timestamp in self._session_rate_limits.get(key, [])
+            if now - timestamp < RATE_LIMIT_WINDOW_SECONDS
+        ]
+        if len(bucket) >= RATE_LIMIT_MAX_ATTEMPTS:
+            raise IntegrationRateLimitError(
+                "Too many connection attempts. Please wait a few seconds and try again."
+            )
+        bucket.append(now)
+        self._session_rate_limits[key] = bucket
 
     def _load_connections(self, user_id: str) -> dict[str, sqlite3.Row]:
         with self._connect() as connection:
@@ -285,7 +353,8 @@ class IntegrationsService:
             ).fetchall()
         return {row["provider"]: row for row in rows}
 
-    def get_integrations(self, user_id: str = "demo-user") -> dict[str, Any]:
+    def get_integrations(self, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        user_id = self._resolve_user_id(user_id)
         connections = self._load_connections(user_id)
         categories: list[dict[str, Any]] = []
         connected_count = 0
@@ -308,7 +377,7 @@ class IntegrationsService:
                         "type": provider["type"],
                         "status": "Connected" if is_connected else "Not Connected",
                         "connection_id": connection["id"] if connection else None,
-                        "connection_ref": connection["connection_ref"] if connection else None,
+                        "connection_ref": connection["connection_id"] if connection else None,
                     }
                 )
             categories.append(
@@ -329,11 +398,15 @@ class IntegrationsService:
             "categories": categories,
         }
 
+    def has_connection(self, provider: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        user_id = self._resolve_user_id(user_id)
+        provider_config = self._get_provider(provider)
+        connections = self._load_connections(user_id)
+        row = connections.get(provider_config["slug"])
+        return bool(row and row["status"] == "connected")
+
     def detect_env_key(self, provider: str) -> dict[str, Any]:
         provider_config = self._get_provider(provider)
-        if provider_config["type"] != "api_key":
-            raise ValueError("Env detection is only available for API-key providers.")
-
         env_map = self._read_env_sources()
         for key in provider_config["env_keys"]:
             value = env_map.get(key)
@@ -354,10 +427,9 @@ class IntegrationsService:
             "masked_key": None,
         }
 
-    def connect_api_key(self, provider: str, api_key: str, user_id: str = "demo-user") -> dict[str, Any]:
+    def connect_api_key(self, provider: str, api_key: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        user_id = self._resolve_user_id(user_id)
         provider_config = self._get_provider(provider)
-        if provider_config["type"] != "api_key":
-            raise ValueError("This provider requires OAuth, not an API key.")
 
         encrypted_secret = self._encrypt_secret(api_key)
         connection_id = self._upsert_connection(
@@ -367,7 +439,7 @@ class IntegrationsService:
             status="connected",
             encrypted_secret=encrypted_secret,
             env_key=None,
-            connection_ref=f"conn-{provider_config['slug']}-{uuid4().hex[:12]}",
+            nango_connection_id=f"conn-{provider_config['slug']}-{uuid4().hex[:12]}",
         )
         return {
             "connection_id": connection_id,
@@ -376,12 +448,44 @@ class IntegrationsService:
             "status": "Connected",
         }
 
-    def connect_oauth(self, provider: str, user_id: str = "demo-user") -> dict[str, Any]:
-        provider_config = self._get_provider(provider)
-        if provider_config["type"] != "oauth":
-            raise ValueError("This provider expects an API key, not OAuth.")
+    def save_api_key(self, provider: str, api_key: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        return self.connect_api_key(provider=provider, api_key=api_key, user_id=user_id)
 
-        auth_url, connection_ref = self._build_nango_auth_url(provider_config["slug"], user_id)
+    def connect_oauth(self, provider: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        return self.create_connect_session(provider=provider, user_id=user_id)
+
+    def create_connect_session(self, provider: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        user_id = self._resolve_user_id(user_id)
+        provider_config = self._get_provider(provider)
+        self._enforce_session_rate_limit(user_id, provider_config["slug"])
+        integration_id = self._get_nango_integration_id(provider_config["slug"])
+        response = self._nango_request(
+            "POST",
+            "/connect/sessions",
+            {
+                "tags": {
+                    "end_user_id": user_id,
+                    "provider": provider_config["slug"],
+                },
+                "end_user": {"id": user_id},
+                "allowed_integrations": [integration_id],
+            },
+        )
+        data = response.get("data", {})
+        connect_token = (
+            data.get("connect_session_token")
+            or data.get("token")
+            or response.get("connect_session_token")
+            or response.get("token")
+        )
+        connect_link = (
+            data.get("connect_link")
+            or data.get("link")
+            or response.get("connect_link")
+            or response.get("link")
+        )
+        if not connect_token:
+            raise IntegrationConfigError("Nango did not return a connect session token.")
         connection_id = self._upsert_connection(
             user_id=user_id,
             provider=provider_config["slug"],
@@ -389,15 +493,116 @@ class IntegrationsService:
             status="pending",
             encrypted_secret=None,
             env_key=None,
-            connection_ref=connection_ref,
+            nango_connection_id=None,
         )
         return {
             "connection_id": connection_id,
             "provider": provider_config["slug"],
             "type": "oauth",
             "status": "Pending",
-            "auth_url": auth_url,
+            "connect_session_token": connect_token,
         }
+
+    def get_connection(self, provider: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
+        user_id = self._resolve_user_id(user_id)
+        provider_config = self._get_provider(provider)
+        connections = self._load_connections(user_id)
+        row = connections.get(provider_config["slug"])
+        if not row or row["status"] != "connected":
+            return None
+        return {
+            "connection_id": row["id"],
+            "provider": provider_config["slug"],
+            "type": row["type"],
+            "status": "Connected",
+            "connection_ref": row["connection_id"],
+        }
+
+    def get_connection_status(self, provider: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        user_id = self._resolve_user_id(user_id)
+        provider_config = self._get_provider(provider)
+        local_connection = self._load_connections(user_id).get(provider_config["slug"])
+        if local_connection and local_connection["type"] == "oauth" and local_connection["status"] == "pending":
+            self._refresh_oauth_connection(provider_config["slug"], user_id)
+            local_connection = self._load_connections(user_id).get(provider_config["slug"])
+        if not local_connection:
+            return {
+                "provider": provider_config["slug"],
+                "status": "not_connected",
+                "connection_id": None,
+                "connection_ref": None,
+            }
+        return {
+            "provider": provider_config["slug"],
+            "status": local_connection["status"],
+            "connection_id": local_connection["id"],
+            "connection_ref": local_connection["connection_id"],
+        }
+
+    def disconnect_integration(self, provider: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        user_id = self._resolve_user_id(user_id)
+        provider_config = self._get_provider(provider)
+        connections = self._load_connections(user_id)
+        row = connections.get(provider_config["slug"])
+        if row and row["type"] == "oauth" and row["connection_id"]:
+            integration_id = self._get_nango_integration_id(provider_config["slug"])
+            try:
+                self._nango_request(
+                    "DELETE",
+                    f"/connection/{urllib.parse.quote(str(row['connection_id']))}",
+                    query={"provider_config_key": integration_id},
+                )
+            except IntegrationConfigError:
+                pass
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE integration_connections
+                SET status = ?, connection_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND provider = ?
+                """,
+                ("revoked", user_id, provider_config["slug"]),
+            )
+        return {"provider": provider_config["slug"], "disconnected": True}
+
+    def handle_nango_webhook(
+        self,
+        payload: dict[str, Any],
+        signature: str | None,
+        raw_body: bytes | None = None,
+    ) -> dict[str, Any]:
+        self._verify_webhook_signature(signature, payload, raw_body=raw_body)
+        webhook_type = str(payload.get("type") or "").lower()
+        operation = str(payload.get("operation") or "").lower()
+        provider_key = payload.get("providerConfigKey") or payload.get("provider")
+        provider_slug = self._provider_slug_from_nango(provider_key) if provider_key else None
+        end_user = payload.get("endUser") or {}
+        user_id = self._resolve_user_id(end_user.get("endUserId"))
+
+        if webhook_type == "auth" and operation == "creation" and provider_slug:
+            status = "connected" if payload.get("success") else "failed"
+            self._upsert_connection(
+                user_id=user_id,
+                provider=provider_slug,
+                connection_type="oauth",
+                status=status,
+                encrypted_secret=None,
+                env_key=None,
+                nango_connection_id=payload.get("connectionId"),
+            )
+        elif webhook_type == "connection.updated" and provider_slug:
+            raw_status = str(payload.get("status") or "").lower()
+            mapped_status = self._normalize_nango_status(raw_status or "connected")
+            self._upsert_connection(
+                user_id=user_id,
+                provider=provider_slug,
+                connection_type="oauth",
+                status=mapped_status,
+                encrypted_secret=None,
+                env_key=None,
+                nango_connection_id=payload.get("connection_id") or payload.get("connectionId"),
+            )
+        return {"received": True}
 
     def _upsert_connection(
         self,
@@ -407,7 +612,7 @@ class IntegrationsService:
         status: str,
         encrypted_secret: str | None,
         env_key: str | None,
-        connection_ref: str | None,
+        nango_connection_id: str | None,
     ) -> str:
         existing_id = None
         with self._connect() as connection:
@@ -419,15 +624,16 @@ class IntegrationsService:
             connection.execute(
                 """
                 INSERT INTO integration_connections (
-                    id, user_id, provider, type, status, encrypted_secret, env_key, connection_ref
+                    id, user_id, provider, type, status, encrypted_secret, env_key, connection_ref, connection_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, provider) DO UPDATE SET
                     type = excluded.type,
                     status = excluded.status,
                     encrypted_secret = COALESCE(excluded.encrypted_secret, integration_connections.encrypted_secret),
                     env_key = COALESCE(excluded.env_key, integration_connections.env_key),
                     connection_ref = COALESCE(excluded.connection_ref, integration_connections.connection_ref),
+                    connection_id = COALESCE(excluded.connection_id, integration_connections.connection_id),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -438,7 +644,8 @@ class IntegrationsService:
                     status,
                     encrypted_secret,
                     env_key,
-                    connection_ref,
+                    nango_connection_id,
+                    nango_connection_id,
                 ),
             )
         return existing_id
@@ -464,27 +671,133 @@ class IntegrationsService:
 
         return fernet.encrypt(value.encode("utf-8")).decode("utf-8")
 
-    def _build_nango_auth_url(self, provider_slug: str, user_id: str) -> tuple[str, str]:
-        base_url = os.getenv("NANGO_BASE_URL")
-        public_key = os.getenv("NANGO_PUBLIC_KEY")
-        provider_env_name = f"NANGO_PROVIDER_{provider_slug.upper().replace('-', '_')}"
-        provider_config_key = os.getenv(provider_env_name)
-        success_url = os.getenv("NANGO_SUCCESS_URL")
-
-        if not base_url or not public_key or not provider_config_key:
-            raise IntegrationConfigError(
-                f"Missing Nango config. Expected NANGO_BASE_URL, NANGO_PUBLIC_KEY, and {provider_env_name}."
-            )
-
-        connection_ref = f"{user_id}-{provider_slug}-{uuid4().hex[:10]}"
-        auth_url = (
-            f"{base_url.rstrip('/')}/oauth/connect?"
-            f"public_key={public_key}&provider_config_key={provider_config_key}"
-            f"&connection_id={connection_ref}"
+    def _get_nango_integration_id(self, provider_slug: str) -> str:
+        provider_env_name = f"NANGO_INTEGRATION_{provider_slug.upper().replace('-', '_')}"
+        return os.getenv(
+            provider_env_name,
+            NANGO_PROVIDER_MAP.get(provider_slug, provider_slug),
         )
-        if success_url:
-            auth_url = f"{auth_url}&success_url={success_url}"
-        return auth_url, connection_ref
+
+    def _nango_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        query: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        secret_key = os.getenv("NANGO_SECRET_KEY")
+        if not secret_key:
+            raise IntegrationConfigError("NANGO_SECRET_KEY is not configured.")
+        base_url = os.getenv("NANGO_API_BASE_URL", "https://api.nango.dev").rstrip("/")
+        url = f"{base_url}{path}"
+        if query:
+            url = f"{url}?{urllib.parse.urlencode(query, doseq=True)}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8") if body is not None else None,
+            headers={
+                "Authorization": f"Bearer {secret_key}",
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise IntegrationConfigError(
+                f"Nango request failed ({exc.code}): {detail or exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise IntegrationConfigError("Could not reach Nango API.") from exc
+        return json.loads(payload) if payload else {}
+
+    def _load_nango_connections(self, user_id: str) -> dict[str, dict[str, Any]]:
+        try:
+            response = self._nango_request(
+                "GET",
+                "/connections",
+                query={"tags[end_user_id]": user_id, "limit": "200"},
+            )
+        except IntegrationConfigError:
+            return {}
+        mapped: dict[str, dict[str, Any]] = {}
+        payload_connections = response.get("connections")
+        if not isinstance(payload_connections, list):
+            payload_connections = response.get("data", {}).get("connections", [])
+        for connection in payload_connections:
+            provider = (
+                connection.get("provider_config_key")
+                or connection.get("provider")
+                or connection.get("connection_config")
+                or connection.get("connectionConfig")
+            )
+            if not provider:
+                continue
+            mapped[self._provider_slug_from_nango(provider)] = connection
+        return mapped
+
+    def _refresh_oauth_connection(self, provider: str, user_id: str) -> None:
+        oauth_connections = self._load_nango_connections(user_id)
+        oauth_connection = oauth_connections.get(provider)
+        if not oauth_connection:
+            return
+        connection_ref = (
+            oauth_connection.get("connection_id")
+            or oauth_connection.get("id")
+            or oauth_connection.get("connectionId")
+        )
+        self._upsert_connection(
+            user_id=user_id,
+            provider=provider,
+            connection_type="oauth",
+            status=self._normalize_nango_status(
+                str(oauth_connection.get("status") or "connected")
+            ),
+            encrypted_secret=None,
+            env_key=None,
+            nango_connection_id=connection_ref,
+        )
+
+    def _provider_slug_from_nango(self, provider_key: str) -> str:
+        key_slug = _slugify(provider_key)
+        reverse_map = {
+            _slugify(nango_key): provider_slug
+            for provider_slug, nango_key in NANGO_PROVIDER_MAP.items()
+        }
+        return reverse_map.get(key_slug, key_slug)
+
+    def _normalize_nango_status(self, status: str) -> str:
+        normalized = status.lower()
+        if normalized in {"connected", "success", "ok"}:
+            return "connected"
+        if normalized in {"revoked", "deleted", "disconnected"}:
+            return "revoked"
+        if normalized in {"failed", "error"}:
+            return "failed"
+        if normalized in {"pending", "created"}:
+            return "pending"
+        return normalized or "pending"
+
+    def _verify_webhook_signature(
+        self,
+        signature: str | None,
+        payload: dict[str, Any],
+        raw_body: bytes | None = None,
+    ) -> None:
+        secret = os.getenv("NANGO_WEBHOOK_SECRET") or os.getenv("NANGO_SECRET_KEY")
+        if not secret:
+            raise IntegrationConfigError("NANGO_SECRET_KEY is not configured.")
+        if not signature:
+            raise IntegrationAuthError("Missing Nango webhook signature.")
+        serialized = raw_body or json.dumps(
+            payload,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        expected = hashlib.sha256(secret.encode("utf-8") + serialized).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise IntegrationAuthError("Invalid Nango webhook signature.")
 
     def _read_env_sources(self) -> dict[str, str]:
         values = dict(os.environ)

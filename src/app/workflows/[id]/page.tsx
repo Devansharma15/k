@@ -2,11 +2,22 @@
 
 import { use, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bot, ChevronDown, ChevronRight, ChevronsLeft, ChevronsRight, Plus, Play, Save, Sparkles } from "lucide-react";
+import {
+  Bot,
+  ChevronDown,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  Download,
+  Play,
+  Save,
+  Sparkles,
+} from "lucide-react";
 
 import { WorkflowCanvas } from "@/features/workflows/components/WorkflowCanvas";
 import {
   generateWorkflowFromPrompt,
+  getPlatformRunLogs,
   getPlatformWorkflow,
   listWorkflowNodeTypes,
   publishPlatformWorkflow,
@@ -16,53 +27,111 @@ import {
   type WorkflowDefinition,
   type WorkflowNodeDefinition,
   type WorkflowNodeType,
+  type WorkflowRunLogsResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const emptySnapshot: WorkflowDefinition = {
   name: "New Workflow",
-  nodes: [
-    {
-      id: "trigger-1",
-      type: "trigger_webhook",
-      name: "Webhook Trigger",
-      position: { x: 100, y: 180 },
-      config: { path: "/webhooks/new-flow" },
-      ai_brain: false,
-      memory: null,
-      retry_policy: { max_retries: 0, backoff: "none", retry_on: [] },
-      timeout_ms: 5000,
-    },
-  ],
+  nodes: [],
   edges: [],
 };
+
+const VARIABLE_EXAMPLES = [
+  "{{trigger.amount}}",
+  "{{stripe.customer_email}}",
+  "{{global_vars.mode}}",
+];
+
+function collectNodeValidation(
+  snapshot: WorkflowDefinition,
+  nodeTypes: WorkflowNodeType[],
+): {
+  map: Record<string, string[]>;
+  critical: Array<{ nodeId: string; message: string }>;
+} {
+  const metadata = new Map(nodeTypes.map((nodeType) => [nodeType.type, nodeType]));
+  const map: Record<string, string[]> = {};
+  const critical: Array<{ nodeId: string; message: string }> = [];
+
+  for (const node of snapshot.nodes) {
+    const typeMeta = metadata.get(node.type);
+    if (!typeMeta) {
+      map[node.id] = ["Unsupported node type"];
+      critical.push({ nodeId: node.id, message: "Unsupported node type" });
+      continue;
+    }
+    const warnings: string[] = [];
+    const requiredFields = typeMeta.required_fields ?? [];
+    const requiredSecrets = typeMeta.secrets_required ?? [];
+    for (const field of requiredFields) {
+      const value = node.config?.[field];
+      if (value === undefined || value === null || value === "") {
+        warnings.push(`Missing required field: ${field}`);
+      }
+    }
+    for (const secret of requiredSecrets) {
+      const value = node.config?.[secret];
+      if (value === undefined || value === null || value === "") {
+        warnings.push(`Missing API key/secret: ${secret}`);
+      }
+    }
+    if (warnings.length) {
+      map[node.id] = warnings;
+      for (const message of warnings) {
+        critical.push({ nodeId: node.id, message });
+      }
+    }
+  }
+
+  return { map, critical };
+}
 
 export default function WorkflowPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const qc = useQueryClient();
   const [draft, setDraft] = useState(emptySnapshot);
-  const [name, setName] = useState("Workflow Studio");
+  const [name, setName] = useState("");
   const [prompt, setPrompt] = useState(
     "Send Slack message when new Stripe payment is received and store in Notion",
   );
   const [feedback, setFeedback] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [familyOpen, setFamilyOpen] = useState<Record<string, boolean>>({});
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [activeFieldKey, setActiveFieldKey] = useState<string | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
   const workflowQuery = useQuery({
     queryKey: ["platform-workflow", id],
     queryFn: () => getPlatformWorkflow(id),
+    refetchInterval: (query) =>
+      query.state.data?.is_locked ? 2000 : false,
   });
   const nodeTypesQuery = useQuery({
     queryKey: ["workflow-node-types"],
     queryFn: listWorkflowNodeTypes,
   });
+  const runLogsQuery = useQuery<WorkflowRunLogsResponse | null>({
+    queryKey: ["workflow-run-logs", id, activeRunId],
+    queryFn: () => getPlatformRunLogs(id, activeRunId as string),
+    enabled: Boolean(activeRunId),
+    retry: false,
+    refetchInterval: (query) => {
+      if (query.state.error) return false;
+      if (query.state.data === null) return false;
+      const status = query.state.data?.status;
+      if (status && ["completed", "failed", "cancelled"].includes(status)) return false;
+      return 1500;
+    },
+  });
 
   useEffect(() => {
-    if (!workflowQuery.data) return;
-    setName(workflowQuery.data.name);
-    setDraft(workflowQuery.data.draft_snapshot);
-  }, [workflowQuery.data]);
+    if (!runLogsQuery.data) return;
+    if (["completed", "failed", "cancelled"].includes(runLogsQuery.data.status)) {
+      qc.invalidateQueries({ queryKey: ["platform-workflow", id] });
+    }
+  }, [id, qc, runLogsQuery.data]);
 
   const groupedNodeTypes = useMemo(() => {
     const groups = new Map<string, WorkflowNodeType[]>();
@@ -72,23 +141,54 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
     return Array.from(groups.entries());
   }, [nodeTypesQuery.data]);
 
-  useEffect(() => {
-    if (!groupedNodeTypes.length) return;
-    setFamilyOpen((current) => {
-      const next = { ...current };
-      for (const [family] of groupedNodeTypes) {
-        if (next[family] === undefined) next[family] = true;
-      }
-      return next;
-    });
-  }, [groupedNodeTypes]);
+  const isLocked = workflowQuery.data?.is_locked ?? false;
+  const effectiveName = name || workflowQuery.data?.name || "Workflow Studio";
+  const effectiveDraft =
+    draft.nodes.length === 0 && draft.edges.length === 0 && workflowQuery.data
+      ? workflowQuery.data.draft_snapshot
+      : draft;
+  const lockSummary = workflowQuery.data?.active_run_id
+    ? `Run ${workflowQuery.data.active_run_id} is ${workflowQuery.data.active_run_status}.`
+    : "Workflow is locked while an active run is executing.";
+
+  const validation = useMemo(
+    () => collectNodeValidation(effectiveDraft, nodeTypesQuery.data ?? []),
+    [effectiveDraft, nodeTypesQuery.data],
+  );
+  const nodeStatuses = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const step of runLogsQuery.data?.logs ?? []) {
+      map[step.node_id] = step.status;
+    }
+    return map;
+  }, [runLogsQuery.data]);
+
+  const selectedNode = useMemo(
+    () => effectiveDraft.nodes.find((node) => node.id === selectedNodeId) ?? null,
+    [effectiveDraft.nodes, selectedNodeId],
+  );
+  const selectedNodeType = useMemo(
+    () =>
+      (nodeTypesQuery.data ?? []).find((item) => item.type === selectedNode?.type) ?? null,
+    [nodeTypesQuery.data, selectedNode?.type],
+  );
+  const selectableVariables = useMemo(() => {
+    const tokens = new Set<string>(VARIABLE_EXAMPLES);
+    tokens.add("{{input}}");
+    tokens.add("{{global_vars.mode}}");
+    for (const node of effectiveDraft.nodes) {
+      tokens.add(`{{${node.id}}}`);
+      tokens.add(`{{${node.id}.output}}`);
+    }
+    return Array.from(tokens);
+  }, [effectiveDraft.nodes]);
 
   const invalidateWorkflow = async () => {
     await qc.invalidateQueries({ queryKey: ["platform-workflow", id] });
   };
 
   const saveMutation = useMutation({
-    mutationFn: () => updatePlatformWorkflow(id, name, draft),
+    mutationFn: () => updatePlatformWorkflow(id, effectiveName, effectiveDraft),
     onSuccess: async () => {
       setFeedback("Draft saved.");
       await invalidateWorkflow();
@@ -96,8 +196,14 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
     onError: (e: Error) => setFeedback(e.message),
   });
   const validateMutation = useMutation({
-    mutationFn: () => validatePlatformWorkflow(id, name, draft),
-    onSuccess: (r) => setFeedback(`Validation passed: ${r.nodes} nodes, ${r.edges} edges.`),
+    mutationFn: () => validatePlatformWorkflow(id, effectiveName, effectiveDraft),
+    onSuccess: (result) => {
+      if (Array.isArray(result.errors) && result.errors.length) {
+        setFeedback(`Validation found ${result.errors.length} issue(s).`);
+        return;
+      }
+      setFeedback(`Validation passed: ${result.nodes} nodes, ${result.edges} edges.`);
+    },
     onError: (e: Error) => setFeedback(e.message),
   });
   const publishMutation = useMutation({
@@ -115,11 +221,17 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
         debug: true,
         input: { source: "workflow-studio" },
       }),
-    onSuccess: () => setFeedback("Test run triggered."),
+    onSuccess: (run) => {
+      setActiveRunId(run.id);
+      setFeedback("Test run started. Debug logs are live.");
+    },
     onError: (e: Error) => setFeedback(e.message),
   });
   const generateMutation = useMutation({
     mutationFn: () => generateWorkflowFromPrompt(prompt),
+    onMutate: () => {
+      setActiveRunId(null);
+    },
     onSuccess: (generated) => {
       setDraft(generated);
       setName(generated.name);
@@ -129,18 +241,86 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
   });
 
   const addNode = (nodeType: WorkflowNodeType) => {
+    if (isLocked) return;
     const node: WorkflowNodeDefinition = {
       id: `${nodeType.type}-${crypto.randomUUID()}`,
       type: nodeType.type,
       name: nodeType.label,
-      position: { x: 140 + draft.nodes.length * 70, y: 120 + (draft.nodes.length % 4) * 110 },
-      config: { ...nodeType.default_config },
+      position: {
+        x: 140 + effectiveDraft.nodes.length * 70,
+        y: 120 + (effectiveDraft.nodes.length % 4) * 110,
+      },
+      config: { ...(nodeType.default_config ?? {}) },
+      input_mapping: {},
+      output_mapping: {},
       ai_brain: nodeType.supports_ai_brain,
       memory: nodeType.supports_memory ? "short_term" : null,
       retry_policy: { max_retries: 1, backoff: "exponential", retry_on: ["api_error"] },
       timeout_ms: nodeType.family === "ai" ? 30000 : 10000,
     };
     setDraft((current) => ({ ...current, nodes: [...current.nodes, node] }));
+  };
+
+  const updateSelectedNode = (update: (node: WorkflowNodeDefinition) => WorkflowNodeDefinition) => {
+    if (!selectedNodeId || isLocked) return;
+    setDraft((current) => ({
+      ...current,
+      nodes: current.nodes.map((node) => (node.id === selectedNodeId ? update(node) : node)),
+    }));
+  };
+
+  const insertVariableToken = (token: string) => {
+    if (!activeFieldKey || !selectedNode) return;
+    const [bucket, key] = activeFieldKey.split("::");
+    if (!bucket || !key) return;
+    updateSelectedNode((node) => {
+      if (bucket === "config") {
+        const current = String(node.config[key] ?? "");
+        return { ...node, config: { ...node.config, [key]: `${current}${token}` } };
+      }
+      if (bucket === "input_mapping") {
+        return {
+          ...node,
+          input_mapping: {
+            ...(node.input_mapping ?? {}),
+            [key]: `${node.input_mapping?.[key] ?? ""}${token}`,
+          },
+        };
+      }
+      if (bucket === "output_mapping") {
+        return {
+          ...node,
+          output_mapping: {
+            ...(node.output_mapping ?? {}),
+            [key]: `${node.output_mapping?.[key] ?? ""}${token}`,
+          },
+        };
+      }
+      return node;
+    });
+  };
+
+  const canRun =
+    !isLocked && validation.critical.length === 0 && effectiveDraft.nodes.length > 0;
+
+  const downloadWorkflow = () => {
+    const payload = {
+      name: effectiveName,
+      nodes: effectiveDraft.nodes,
+      edges: effectiveDraft.edges,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${effectiveName.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "workflow"}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setFeedback("Workflow JSON downloaded.");
   };
 
   return (
@@ -157,7 +337,8 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
             />
             <button
               onClick={() => generateMutation.mutate()}
-              className="inline-flex h-12 items-center gap-2 rounded-full bg-primary px-5 text-sm font-semibold text-primary-foreground"
+              disabled={generateMutation.isPending || isLocked}
+              className="inline-flex h-12 items-center gap-2 rounded-full bg-primary px-5 text-sm font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               {generateMutation.isPending ? "Generating..." : "Generate"}
             </button>
@@ -166,7 +347,8 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
               onClick={() => saveMutation.mutate()}
-              className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-2 text-xs font-semibold"
+              disabled={saveMutation.isPending || isLocked}
+              className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Save className="h-4 w-4" />
               {saveMutation.isPending ? "Saving..." : "Save"}
@@ -180,25 +362,46 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
             </button>
             <button
               onClick={() => publishMutation.mutate()}
-              className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-2 text-xs font-semibold"
+              disabled={publishMutation.isPending || isLocked}
+              className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Sparkles className="h-4 w-4" />
               Publish
             </button>
             <button
-              onClick={() => runMutation.mutate()}
+              onClick={downloadWorkflow}
               className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-2 text-xs font-semibold"
+            >
+              <Download className="h-4 w-4" />
+              Download JSON
+            </button>
+            <button
+              onClick={() => {
+                if (!canRun) {
+                  setFeedback("Fix validation warnings before running this workflow.");
+                  return;
+                }
+                runMutation.mutate();
+              }}
+              disabled={runMutation.isPending || !canRun}
+              className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Play className="h-4 w-4" />
               Run Test
             </button>
             <input
-              value={name}
+              value={effectiveName}
               onChange={(e) => setName(e.target.value)}
-              className="ml-auto h-10 min-w-[220px] rounded-full border border-border bg-card px-4 text-sm outline-none"
+              disabled={isLocked}
+              className="ml-auto h-10 min-w-[220px] rounded-full border border-border bg-card px-4 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-60"
             />
           </div>
 
+          {isLocked ? (
+            <p className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">
+              Workflow locked. {lockSummary}
+            </p>
+          ) : null}
           {feedback ? (
             <p className="mt-3 rounded-xl border border-border bg-card px-3 py-2 text-sm text-muted-foreground">
               {feedback}
@@ -219,13 +422,19 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
               onClick={() => setPaletteOpen((current) => !current)}
               className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border bg-card text-muted-foreground"
             >
-              {paletteOpen ? <ChevronsLeft className="h-4 w-4" /> : <ChevronsRight className="h-4 w-4" />}
+              {paletteOpen ? (
+                <ChevronsLeft className="h-4 w-4" />
+              ) : (
+                <ChevronsRight className="h-4 w-4" />
+              )}
             </button>
 
             {paletteOpen ? (
               <div className="mt-3 max-h-[calc(100vh-14rem)] space-y-3 overflow-y-auto">
-                {groupedNodeTypes.map(([family, nodes]) => (
-                  <div key={family}>
+                {groupedNodeTypes.map(([family, nodes]) => {
+                  const isOpen = familyOpen[family] ?? true;
+                  return (
+                    <div key={family}>
                     <button
                       onClick={() =>
                         setFamilyOpen((current) => ({ ...current, [family]: !current[family] }))
@@ -235,17 +444,25 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
                       <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                         {family}
                       </p>
-                      {familyOpen[family] ? (
+                      {isOpen ? (
                         <ChevronDown className="h-4 w-4 text-muted-foreground" />
                       ) : (
                         <ChevronRight className="h-4 w-4 text-muted-foreground" />
                       )}
                     </button>
-                    {familyOpen[family] ? (
+                    {isOpen ? (
                       <div className="mt-2 grid gap-2">
                         {nodes.map((nodeType) => (
                           <button
                             key={nodeType.type}
+                            draggable={!isLocked}
+                            onDragStart={(event) => {
+                              event.dataTransfer.setData(
+                                "application/auraflow-node-type",
+                                nodeType.type,
+                              );
+                              event.dataTransfer.effectAllowed = "move";
+                            }}
                             onClick={() => addNode(nodeType)}
                             className="rounded-xl border border-border bg-card px-3 py-2 text-left transition hover:border-primary/40"
                           >
@@ -257,28 +474,174 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
                         ))}
                       </div>
                     ) : null}
-                  </div>
-                ))}
+                    </div>
+                  );
+                })}
               </div>
-            ) : (
-              <div className="mt-3 flex flex-col items-center gap-2">
-                <div className="rounded-full border border-border bg-card p-2">
-                  <Plus className="h-4 w-4 text-muted-foreground" />
-                </div>
-              </div>
-            )}
+            ) : null}
           </div>
         </aside>
 
         <section className="min-h-0 flex-1 p-2">
           <div className="h-full w-full">
             <WorkflowCanvas
-              snapshot={draft}
+              snapshot={effectiveDraft}
               nodeTypesCatalog={nodeTypesQuery.data ?? []}
               onSnapshotChange={setDraft}
+              onSelectNode={setSelectedNodeId}
+              isEditable={!isLocked}
+              nodeStatuses={nodeStatuses}
+              nodeWarnings={validation.map}
             />
           </div>
         </section>
+
+        <aside className="w-[26rem] shrink-0 border-l border-border bg-card/70 p-2">
+          <div className="flex h-full flex-col gap-2">
+            <div className="rounded-2xl border border-border bg-background/80 p-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                Node Config
+              </p>
+              {selectedNode ? (
+                <div className="mt-3 space-y-3">
+                  <p className="text-sm font-semibold text-foreground">{selectedNode.name}</p>
+                  {(Array.from(
+                    new Set([
+                      ...Object.keys(selectedNode.config ?? {}),
+                      ...Object.keys(selectedNodeType?.config_schema ?? {}),
+                    ]),
+                  ) as string[]).map((field) => (
+                    <label key={field} className="block space-y-1">
+                      <span className="text-xs uppercase tracking-[0.14em] text-muted-foreground">
+                        {field}
+                      </span>
+                      <input
+                        value={String(selectedNode.config?.[field] ?? "")}
+                        onFocus={() => setActiveFieldKey(`config::${field}`)}
+                        onChange={(event) =>
+                          updateSelectedNode((node) => ({
+                            ...node,
+                            config: { ...node.config, [field]: event.target.value },
+                          }))
+                        }
+                        disabled={isLocked}
+                        className="h-10 w-full rounded-xl border border-border bg-card px-3 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                      />
+                    </label>
+                  ))}
+                  <div className="grid gap-2">
+                    <p className="text-xs uppercase tracking-[0.14em] text-muted-foreground">
+                      Input Mapping
+                    </p>
+                    {Object.entries(selectedNode.input_mapping ?? {}).map(([key, value]) => (
+                      <input
+                        key={key}
+                        value={value}
+                        onFocus={() => setActiveFieldKey(`input_mapping::${key}`)}
+                        onChange={(event) =>
+                          updateSelectedNode((node) => ({
+                            ...node,
+                            input_mapping: {
+                              ...(node.input_mapping ?? {}),
+                              [key]: event.target.value,
+                            },
+                          }))
+                        }
+                        disabled={isLocked}
+                        className="h-10 w-full rounded-xl border border-border bg-card px-3 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                      />
+                    ))}
+                  </div>
+                  <div className="grid gap-2">
+                    <p className="text-xs uppercase tracking-[0.14em] text-muted-foreground">
+                      Output Mapping
+                    </p>
+                    {Object.entries(selectedNode.output_mapping ?? {}).map(([key, value]) => (
+                      <input
+                        key={key}
+                        value={value}
+                        onFocus={() => setActiveFieldKey(`output_mapping::${key}`)}
+                        onChange={(event) =>
+                          updateSelectedNode((node) => ({
+                            ...node,
+                            output_mapping: {
+                              ...(node.output_mapping ?? {}),
+                              [key]: event.target.value,
+                            },
+                          }))
+                        }
+                        disabled={isLocked}
+                        className="h-10 w-full rounded-xl border border-border bg-card px-3 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                      />
+                    ))}
+                  </div>
+                  <div className="rounded-xl border border-border bg-card p-3">
+                    <p className="text-xs uppercase tracking-[0.14em] text-muted-foreground">
+                      Variables
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {selectableVariables.map((token) => (
+                        <button
+                          key={token}
+                          onClick={() => insertVariableToken(token)}
+                          className="rounded-full border border-border px-2 py-1 text-[10px] font-semibold text-muted-foreground"
+                        >
+                          {token}
+                        </button>
+                      ))}
+                    </div>
+                    {runLogsQuery.data && activeFieldKey ? (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Preview available during run: resolved values are shown in debug logs.
+                      </p>
+                    ) : null}
+                  </div>
+                  {validation.map[selectedNode.id]?.length ? (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                      {validation.map[selectedNode.id].map((message) => (
+                        <p key={message}>Warning: {message}</p>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="mt-2 text-sm text-muted-foreground">Select a node to edit settings.</p>
+              )}
+            </div>
+
+            <div className="min-h-0 flex-1 rounded-2xl border border-border bg-background/80 p-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                Run Debug
+              </p>
+              {validation.critical.length ? (
+                <div className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                  {validation.critical.map((item, index) => (
+                    <p key={`${item.nodeId}-${index}`}>
+                      {item.nodeId}: {item.message}
+                    </p>
+                  ))}
+                </div>
+              ) : null}
+              <div className="mt-3 max-h-[42vh] space-y-2 overflow-y-auto rounded-xl border border-border bg-card p-3">
+                {(runLogsQuery.data?.logs ?? []).length ? (
+                  (runLogsQuery.data?.logs ?? []).map((log, index) => (
+                    <div key={`${log.node_id}-${log.timestamp}-${index}`} className="rounded-lg border border-border p-2 text-xs">
+                      <p className="font-semibold text-foreground">
+                        [{log.node_id}] {log.status}
+                      </p>
+                      <p className="mt-1 text-muted-foreground">{log.message}</p>
+                      <p className="mt-1 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                        Attempt {log.attempt} • {new Date(log.timestamp).toLocaleTimeString()}
+                      </p>
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-xs text-muted-foreground">Run logs will appear here once a test run starts.</p>
+                )}
+              </div>
+            </div>
+          </div>
+        </aside>
       </main>
     </div>
   );

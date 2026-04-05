@@ -14,6 +14,16 @@ const familyStyles: Record<string, string> = {
   integration: "from-rose-500/20 to-rose-500/5 border-rose-400/30",
 };
 
+const statusStyles: Record<string, string> = {
+  idle: "text-slate-300 border-slate-400/30",
+  running: "text-amber-300 border-amber-400/40",
+  completed: "text-emerald-300 border-emerald-400/40",
+  success: "text-emerald-300 border-emerald-400/40",
+  failed: "text-rose-300 border-rose-400/40",
+  waiting_approval: "text-orange-300 border-orange-400/40",
+  skipped: "text-slate-400 border-slate-500/40",
+};
+
 function FamilyIcon({ family }: { family: string }) {
   if (family === "trigger") return <Zap className="h-4 w-4 text-emerald-300" />;
   if (family === "ai") return <Bot className="h-4 w-4 text-violet-300" />;
@@ -25,6 +35,8 @@ function FamilyIcon({ family }: { family: string }) {
 
 export const PlatformNode = memo(({ data, selected }: NodeProps) => {
   const family = data.family ?? "core";
+  const status = data.status ?? "idle";
+  const warnings = Array.isArray(data.warnings) ? (data.warnings as string[]) : [];
   return (
     <div
       className={cn(
@@ -64,6 +76,21 @@ export const PlatformNode = memo(({ data, selected }: NodeProps) => {
             <TimerReset className="h-3 w-3" />
             {data.timeout_ms ?? 0}ms
           </div>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <span
+            className={cn(
+              "rounded-full border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
+              statusStyles[status] ?? statusStyles.idle,
+            )}
+          >
+            {status}
+          </span>
+          {warnings.length ? (
+            <span className="rounded-full border border-amber-400/40 bg-amber-500/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-amber-300">
+              {warnings.length} warning{warnings.length > 1 ? "s" : ""}
+            </span>
+          ) : null}
         </div>
       </div>
 

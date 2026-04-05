@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 import urllib.error
@@ -11,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from .integrations_service import integrations_service
 
 
 DEFAULT_WORKSPACE_ID = "demo-workspace"
@@ -21,6 +25,13 @@ class PauseIteration(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__("Workflow is waiting for human approval.")
         self.payload = payload
+
+
+class WorkflowLockedError(Exception):
+    def __init__(self, run_id: str, status: str) -> None:
+        super().__init__(f"Workflow is locked during active run ({run_id}, status={status}).")
+        self.run_id = run_id
+        self.status = status
 
 
 def _utc_now() -> str:
@@ -131,6 +142,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "Slack Action",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "slack",
         "default_config": {"action": "send_message"},
     },
     {
@@ -139,6 +151,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "Notion Action",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "notion",
         "default_config": {"action": "create_page"},
     },
     {
@@ -147,6 +160,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "Stripe Action",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "stripe",
         "default_config": {"action": "create_payment_link"},
     },
     {
@@ -155,6 +169,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "Gmail Action",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "gmail",
         "default_config": {"action": "send_email"},
     },
     {
@@ -163,6 +178,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "Google Sheets Action",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "google-sheets",
         "default_config": {"action": "append_row"},
     },
     {
@@ -171,6 +187,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "HubSpot Action",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "hubspot",
         "default_config": {"action": "create_contact"},
     },
     {
@@ -179,6 +196,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "GitHub Action",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "github",
         "default_config": {"action": "create_issue"},
     },
     {
@@ -187,6 +205,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "Zendesk Action",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "zendesk",
         "default_config": {"action": "create_ticket"},
     },
     {
@@ -195,6 +214,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "Qdrant Search",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "qdrant",
         "default_config": {"action": "search_vectors"},
     },
     {
@@ -251,6 +271,7 @@ NODE_TYPES: list[dict[str, Any]] = [
         "label": "Shopify Trigger",
         "supports_ai_brain": False,
         "supports_memory": False,
+        "provider_slug": "shopify",
         "default_config": {"action": "new_order"},
     },
     {
@@ -270,6 +291,42 @@ NODE_TYPES: list[dict[str, Any]] = [
         "default_config": {"action": "enrich"},
     },
 ]
+
+
+def _infer_field_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "string"
+
+
+def _enrich_node_type(node_type: dict[str, Any]) -> dict[str, Any]:
+    defaults = node_type.get("default_config", {})
+    config_schema: dict[str, Any] = node_type.get("config_schema") or {}
+    if not config_schema:
+        for key, value in defaults.items():
+            config_schema[key] = {
+                "type": _infer_field_type(value),
+                "required": value not in ("", None),
+            }
+    required_fields = node_type.get("required_fields")
+    if required_fields is None:
+        required_fields = [
+            key for key, schema in config_schema.items() if bool(schema.get("required"))
+        ]
+    enriched = dict(node_type)
+    enriched["config_schema"] = config_schema
+    enriched["required_fields"] = required_fields
+    enriched["secrets_required"] = node_type.get("secrets_required", [])
+    return enriched
+
+
+NODE_TYPES = [_enrich_node_type(node_type) for node_type in NODE_TYPES]
 
 
 def _node(
@@ -297,6 +354,8 @@ def _node(
             "retry_on": ["timeout", "api_error"],
         },
         "timeout_ms": timeout_ms,
+        "input_mapping": {},
+        "output_mapping": {},
     }
 
 
@@ -673,7 +732,7 @@ class WorkflowPlatformService:
             item = dict(row)
             item["draft_snapshot"] = json.loads(item["draft_snapshot"])
             item["versions"] = []
-            workflows.append(item)
+            workflows.append(self._attach_lock_state(item))
         return workflows
 
     def create_workflow(self, name: str, snapshot: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
@@ -723,10 +782,14 @@ class WorkflowPlatformService:
         payload = dict(workflow)
         payload["draft_snapshot"] = json.loads(payload["draft_snapshot"])
         payload["versions"] = [dict(row) for row in versions]
-        return payload
+        return self._attach_lock_state(payload)
 
     def update_workflow(self, workflow_id: str, name: str, snapshot: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
-        self.validate_snapshot(snapshot)
+        self._assert_workflow_unlocked(workflow_id)
+        validation = self.validate_snapshot(snapshot)
+        if validation["errors"]:
+            first = validation["errors"][0]
+            raise ValueError(f"{first['node_id']}: {first['message']}")
         with self._connect() as connection:
             connection.execute(
                 """
@@ -744,18 +807,61 @@ class WorkflowPlatformService:
         node_ids = {node.get("id") for node in nodes}
         if not nodes:
             raise ValueError("Workflow must include at least one node.")
+        node_type_map = {item["type"]: item for item in NODE_TYPES}
+        errors: list[dict[str, str]] = []
+        for node in nodes:
+            node_type = str(node.get("type"))
+            metadata = node_type_map.get(node_type)
+            if metadata is None:
+                errors.append({"node_id": str(node.get("id")), "message": f"Unsupported node type: {node_type}"})
+                continue
+            config = node.get("config") or {}
+            for field in metadata.get("required_fields", []):
+                value = config.get(field)
+                if value in (None, "", []):
+                    errors.append(
+                        {
+                            "node_id": str(node.get("id")),
+                            "message": f"Missing required field: {field}",
+                        }
+                    )
+            for secret in metadata.get("secrets_required", []):
+                if config.get(secret) in (None, "", []):
+                    errors.append(
+                        {
+                            "node_id": str(node.get("id")),
+                            "message": f"Missing secret: {secret}",
+                        }
+                    )
+            provider_slug = metadata.get("provider_slug")
+            if provider_slug and not integrations_service.has_connection(provider_slug):
+                errors.append(
+                    {
+                        "node_id": str(node.get("id")),
+                        "message": f"Connect first: {metadata.get('label', provider_slug)}",
+                    }
+                )
         for edge in edges:
             if edge.get("source") not in node_ids or edge.get("target") not in node_ids:
                 raise ValueError("Edges must connect valid nodes.")
             if edge.get("condition") is None:
                 raise ValueError("Every edge must define a condition.")
+            self._validate_safe_expression(str(edge.get("condition", "true")))
+        for node in nodes:
+            if node.get("type") == "condition":
+                expression = str((node.get("config") or {}).get("expression", "True"))
+                self._validate_safe_expression(expression)
         self._detect_cycles(nodes, edges)
-        return {"valid": True, "nodes": len(nodes), "edges": len(edges)}
+        return {"valid": len(errors) == 0, "nodes": len(nodes), "edges": len(edges), "errors": errors}
 
     def publish_workflow(self, workflow_id: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        self._assert_workflow_unlocked(workflow_id)
         workflow = self.get_workflow(workflow_id)
         snapshot = workflow["draft_snapshot"]
-        self.validate_snapshot(snapshot)
+        validation = self.validate_snapshot(snapshot)
+        if validation["errors"]:
+            first = validation["errors"][0]
+            raise ValueError(f"{first['node_id']}: {first['message']}")
         with self._connect() as connection:
             latest = connection.execute(
                 "SELECT COALESCE(MAX(version_number), 0) AS latest FROM workflow_versions WHERE workflow_id = ?",
@@ -789,6 +895,7 @@ class WorkflowPlatformService:
         return self.get_workflow(workflow_id)
 
     def rollback_workflow(self, workflow_id: str, version_id: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        self._assert_workflow_unlocked(workflow_id)
         with self._connect() as connection:
             version = connection.execute(
                 "SELECT json_snapshot FROM workflow_versions WHERE workflow_id = ? AND id = ?",
@@ -820,7 +927,7 @@ class WorkflowPlatformService:
         return [dict(row) for row in rows]
 
     def list_node_types(self) -> list[dict[str, Any]]:
-        return NODE_TYPES
+        return [dict(item) for item in NODE_TYPES]
 
     def list_templates(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -860,6 +967,29 @@ class WorkflowPlatformService:
                 (workflow_id,),
             ).fetchall()
         return [self._deserialize_run(row) for row in rows]
+
+    def get_run_logs(self, workflow_id: str, run_id: str) -> dict[str, Any]:
+        run = self.get_run(workflow_id, run_id)
+        logs = []
+        for step in run.get("steps", []):
+            logs.append(
+                {
+                    "node_id": step["node_id"],
+                    "status": step["status"],
+                    "message": step["error_message"] or f"Node {step['status']}",
+                    "timestamp": step["started_at"],
+                    "attempt": step["attempt"],
+                }
+            )
+        return {
+            "run_id": run_id,
+            "workflow_id": workflow_id,
+            "status": run["status"],
+            "input_payload": run["input_payload"],
+            "context_snapshot": run["context_snapshot"],
+            "final_output": run["final_output"],
+            "logs": logs,
+        }
 
     def get_run(self, workflow_id: str, run_id: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -943,6 +1073,10 @@ class WorkflowPlatformService:
 
         workflow = self.get_workflow(workflow_id)
         snapshot, workflow_version_id = self._resolve_snapshot_for_run(workflow, mode, version_id)
+        validation = self.validate_snapshot(snapshot)
+        if validation["errors"]:
+            first = validation["errors"][0]
+            raise ValueError(f"{first['node_id']}: {first['message']}")
         run_id = f"run_{uuid4().hex}"
         context = {
             "input": input_data or {},
@@ -1072,14 +1206,20 @@ class WorkflowPlatformService:
                 continue
             node = nodes[node_id]
             node_input = self._resolve_node_input(node_id, incoming[node_id], context)
-            result = self._execute_node(run_id, workflow_id, node, node_input, context, mode, debug)
+            mapped_input = self._resolve_input_mapping(node, node_input, context)
+            result = self._execute_node(run_id, workflow_id, node, mapped_input, context, mode, debug)
+            normalized_result = self._apply_output_mapping(node, result, context, mapped_input)
             if result is not None:
-                context["node_outputs"][node_id] = result
-                final_output = result if isinstance(result, dict) else {"value": result}
+                context["node_outputs"][node_id] = normalized_result
+                final_output = (
+                    normalized_result
+                    if isinstance(normalized_result, dict)
+                    else {"value": normalized_result}
+                )
 
             processed.add(node_id)
             for edge in outgoing[node_id]:
-                if self._edge_allows(edge, result, context):
+                if self._edge_allows(edge, normalized_result, context):
                     queue.append(edge["target"])
 
         return final_output
@@ -1103,6 +1243,48 @@ class WorkflowPlatformService:
             "global_vars": context["global_vars"],
         }
 
+    def _resolve_input_mapping(
+        self,
+        node: dict[str, Any],
+        node_input: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        mapping = node.get("input_mapping") or {}
+        if not mapping:
+            return node_input
+        resolved: dict[str, Any] = {}
+        for key, template in mapping.items():
+            resolved[key] = self._resolve_template_value(
+                template,
+                node_input=node_input,
+                context=context,
+                node=node,
+                output=None,
+            )
+        resolved["global_vars"] = context["global_vars"]
+        return resolved
+
+    def _apply_output_mapping(
+        self,
+        node: dict[str, Any],
+        node_result: Any,
+        context: dict[str, Any],
+        node_input: dict[str, Any],
+    ) -> Any:
+        mapping = node.get("output_mapping") or {}
+        if node_result is None or not mapping:
+            return node_result
+        normalized: dict[str, Any] = {"raw_output": node_result}
+        for key, template in mapping.items():
+            normalized[key] = self._resolve_template_value(
+                template,
+                node_input=node_input,
+                context=context,
+                node=node,
+                output=node_result,
+            )
+        return normalized
+
     def _edge_allows(
         self,
         edge: dict[str, Any],
@@ -1114,13 +1296,8 @@ class WorkflowPlatformService:
             return True
         if condition == "false":
             return False
-        scope = {
-            "result": node_result,
-            "input": context["input"],
-            "node_outputs": context["node_outputs"],
-            "global_vars": context["global_vars"],
-        }
-        return bool(eval(condition, {"__builtins__": {}}, scope))
+        scope = self._build_expression_scope(node_result, context, context["input"])
+        return self._safe_eval_expression(condition, scope)
 
     def _execute_node(
         self,
@@ -1203,12 +1380,8 @@ class WorkflowPlatformService:
             }
         if node_type == "condition":
             expression = config.get("expression", "True")
-            scope = {
-                "input": node_input,
-                "node_outputs": context["node_outputs"],
-                "global_vars": context["global_vars"],
-            }
-            return {"result": bool(eval(expression, {"__builtins__": {}}, scope))}
+            scope = self._build_expression_scope(None, context, node_input)
+            return {"result": self._safe_eval_expression(str(expression), scope)}
         if node_type == "delay":
             seconds = min(float(config.get("seconds", 1)), 5.0)
             time.sleep(seconds)
@@ -1259,8 +1432,26 @@ class WorkflowPlatformService:
             )
             return {"sub_workflow_run_id": child_run["id"], "status": child_run["status"]}
         if node_type.startswith("integration_"):
+            provider_slug = next(
+                (
+                    item.get("provider_slug")
+                    for item in NODE_TYPES
+                    if item["type"] == node_type
+                ),
+                None,
+            )
+            connection = (
+                integrations_service.get_connection(provider_slug)
+                if provider_slug
+                else None
+            )
+            if provider_slug and connection is None:
+                raise ValueError(f"Connect first: {provider_slug}")
             return {
                 "integration": node_type.replace("integration_", ""),
+                "provider": provider_slug,
+                "connection_id": connection["connection_id"] if connection else None,
+                "connection_ref": connection["connection_ref"] if connection else None,
                 "action": config.get("action", "execute"),
                 "input": node_input,
                 "status": "accepted",
@@ -1430,6 +1621,7 @@ class WorkflowPlatformService:
     def _deserialize_run(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["initial_input"] = json.loads(payload["initial_input"])
+        payload["input_payload"] = payload["initial_input"]
         payload["context_snapshot"] = json.loads(payload["context_snapshot"])
         payload["final_output"] = json.loads(payload["final_output"]) if payload["final_output"] else None
         return payload
@@ -1440,6 +1632,214 @@ class WorkflowPlatformService:
         payload["output_snapshot"] = json.loads(payload["output_snapshot"]) if payload["output_snapshot"] else None
         payload["decision_snapshot"] = json.loads(payload["decision_snapshot"]) if payload["decision_snapshot"] else None
         return payload
+
+    def _attach_lock_state(self, workflow: dict[str, Any]) -> dict[str, Any]:
+        active = self._get_active_run(workflow["id"])
+        workflow["is_locked"] = active is not None
+        workflow["active_run_id"] = active["id"] if active else None
+        workflow["active_run_status"] = active["status"] if active else None
+        return workflow
+
+    def _get_active_run(self, workflow_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, status
+                FROM workflow_runs
+                WHERE workflow_id = ? AND status IN ('running', 'waiting_approval')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (workflow_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def _assert_workflow_unlocked(self, workflow_id: str) -> None:
+        active = self._get_active_run(workflow_id)
+        if active:
+            raise WorkflowLockedError(active["id"], active["status"])
+
+    def _resolve_template_value(
+        self,
+        value: Any,
+        node_input: Any,
+        context: dict[str, Any],
+        node: dict[str, Any],
+        output: Any,
+    ) -> Any:
+        if not isinstance(value, str):
+            return value
+        token_pattern = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
+        tokens = token_pattern.findall(value)
+        if not tokens:
+            return value
+
+        # Return native type if the whole string is one token.
+        if len(tokens) == 1 and token_pattern.sub("", value).strip() == "":
+            return self._resolve_token_path(
+                tokens[0],
+                node_input=node_input,
+                context=context,
+                node=node,
+                output=output,
+            )
+
+        rendered = value
+        for token in tokens:
+            resolved = self._resolve_token_path(
+                token,
+                node_input=node_input,
+                context=context,
+                node=node,
+                output=output,
+            )
+            rendered = rendered.replace(f"{{{{{token}}}}}", str(resolved))
+            rendered = rendered.replace(f"{{{{ {token} }}}}", str(resolved))
+        return rendered
+
+    def _resolve_token_path(
+        self,
+        token: str,
+        node_input: Any,
+        context: dict[str, Any],
+        node: dict[str, Any],
+        output: Any,
+    ) -> Any:
+        token = token.strip()
+        if not token:
+            return None
+        parts = [part for part in token.split(".") if part]
+        if not parts:
+            return None
+
+        current: Any
+        head = parts[0]
+        remainder = parts[1:]
+        if head in {"input", "trigger"}:
+            current = context["input"]
+        elif head == "global_vars":
+            current = context["global_vars"]
+        elif head == "node_outputs":
+            current = context["node_outputs"]
+        elif head in {"current", "node_input"}:
+            current = node_input
+        elif head in {"output", "result"}:
+            current = output
+        elif head == node.get("id"):
+            current = output
+        elif head in context["node_outputs"]:
+            current = context["node_outputs"][head]
+        else:
+            current = context["input"].get(head) if isinstance(context["input"], dict) else None
+
+        if remainder and remainder[0] == "output":
+            remainder = remainder[1:]
+        for part in remainder:
+            if isinstance(current, dict):
+                current = current.get(part)
+            elif isinstance(current, list):
+                try:
+                    current = current[int(part)]
+                except (TypeError, ValueError, IndexError):
+                    return None
+            else:
+                return None
+        return current
+
+    def _validate_safe_expression(self, expression: str) -> None:
+        normalized = self._normalize_expression(expression)
+        try:
+            tree = ast.parse(normalized, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError("Invalid condition expression.") from exc
+
+        allowed_nodes = (
+            ast.Expression,
+            ast.BoolOp,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Compare,
+            ast.Name,
+            ast.Load,
+            ast.Constant,
+            ast.And,
+            ast.Or,
+            ast.Not,
+            ast.Eq,
+            ast.NotEq,
+            ast.Gt,
+            ast.GtE,
+            ast.Lt,
+            ast.LtE,
+            ast.In,
+            ast.NotIn,
+            ast.Is,
+            ast.IsNot,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Mod,
+            ast.Pow,
+            ast.USub,
+            ast.UAdd,
+            ast.Subscript,
+            ast.Index,
+            ast.List,
+            ast.Tuple,
+            ast.Dict,
+        )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                raise ValueError("Invalid condition expression.")
+            if isinstance(node, ast.Call | ast.Attribute | ast.Lambda | ast.IfExp | ast.ListComp | ast.DictComp | ast.SetComp):
+                raise ValueError("Invalid condition expression.")
+
+    def _normalize_expression(self, expression: str) -> str:
+        normalized = expression.strip()
+        # Convert legacy dict getter expressions to safe subscript form.
+        normalized = re.sub(
+            r"([A-Za-z_][A-Za-z0-9_]*)\.get\((['\"])([A-Za-z0-9_]+)\2\)",
+            r"\1['\3']",
+            normalized,
+        )
+        return normalized
+
+    def _safe_eval_expression(self, expression: str, scope: dict[str, Any]) -> bool:
+        normalized = self._normalize_expression(expression)
+        self._validate_safe_expression(normalized)
+        try:
+            tree = ast.parse(normalized, mode="eval")
+            result = eval(compile(tree, "<condition>", "eval"), {"__builtins__": {}}, scope)  # noqa: S307
+            return bool(result)
+        except Exception as exc:
+            raise ValueError("Invalid condition expression.") from exc
+
+    def _build_expression_scope(
+        self,
+        result: Any,
+        context: dict[str, Any],
+        node_input: Any,
+    ) -> dict[str, Any]:
+        scope: dict[str, Any] = {
+            "result": result,
+            "input": node_input,
+            "node_outputs": context["node_outputs"],
+            "global_vars": context["global_vars"],
+            "true": True,
+            "false": False,
+            "null": None,
+        }
+        if isinstance(node_input, dict):
+            for key, value in node_input.items():
+                if key not in scope and isinstance(key, str):
+                    scope[key] = value
+        if isinstance(result, dict):
+            for key, value in result.items():
+                if key not in scope and isinstance(key, str):
+                    scope[key] = value
+        return scope
 
     def _detect_cycles(self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
         adjacency = {node["id"]: [] for node in nodes}

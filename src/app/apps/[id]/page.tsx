@@ -1,6 +1,6 @@
 "use client";
 
-import React from 'react';
+import React, { use } from 'react';
 import { ChatUI } from '@/components/ChatUI';
 import { 
   Settings, 
@@ -12,7 +12,8 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
-export default function AppPage({ params }: { params: { id: string } }) {
+export default function AppPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = use(params);
   return (
     <div className="flex h-screen -m-8 overflow-hidden">
       {/* Main Chat Area */}
@@ -23,7 +24,7 @@ export default function AppPage({ params }: { params: { id: string } }) {
             <ChevronRight size={12} />
             <span>Apps</span>
             <ChevronRight size={12} />
-            <span className="text-foreground">App {params.id}</span>
+            <span className="text-foreground">App {id}</span>
           </div>
           <div className="flex items-center gap-2">
             <div className="px-2 py-1 bg-emerald-500/10 text-emerald-500 text-[10px] font-bold rounded border border-emerald-500/20">LIVE</div>
