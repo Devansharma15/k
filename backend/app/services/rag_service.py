@@ -5,20 +5,24 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import chromadb
 from chromadb.utils import embedding_functions
 
-# Initialize ChromaDB
-CHROMA_DATA_PATH = "backend/data/chroma"
-os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
-
-chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
-# Use a simple local embedding function
-default_ef = embedding_functions.DefaultEmbeddingFunction()
-
 class RAGService:
     def __init__(self, collection_name: str = "auraflow_docs"):
-        self.collection = chroma_client.get_or_create_collection(
-            name=collection_name, 
-            embedding_function=default_ef
-        )
+        self.collection_name = collection_name
+        self._collection = None
+
+    @property
+    def collection(self):
+        if self._collection is None:
+            # Lazy initialization of ChromaDB
+            CHROMA_DATA_PATH = "backend/data/chroma"
+            os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
+            chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
+            default_ef = embedding_functions.DefaultEmbeddingFunction()
+            self._collection = chroma_client.get_or_create_collection(
+                name=self.collection_name, 
+                embedding_function=default_ef
+            )
+        return self._collection
 
     async def index_file(self, file_path: str):
         """Loads, splits, and indexes a file into ChromaDB."""

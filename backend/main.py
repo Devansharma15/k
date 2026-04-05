@@ -2,9 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from app.api import apps, chat, files, overview, workflow
+from app.api import apps, chat, files, integrations, knowledge_base, overview, workflow, workflow_platform
 
+print("Starting AuraFlow Backend...")
 app = FastAPI(title="AuraFlow Backend")
+print("FastAPI app created.")
 
 allowed_origins = os.getenv(
     "ALLOWED_ORIGINS",
@@ -22,8 +24,11 @@ app.add_middleware(
 
 # Include Routers
 app.include_router(overview.router, prefix="/api", tags=["Overview"])
+app.include_router(integrations.router, prefix="/api", tags=["Integrations"])
+app.include_router(knowledge_base.router, prefix="/api", tags=["Knowledge Base"])
 app.include_router(chat.router, prefix="/api", tags=["Chat"])
 app.include_router(workflow.router, prefix="/api", tags=["Workflow"])
+app.include_router(workflow_platform.router, prefix="/api", tags=["Workflow Platform"])
 app.include_router(apps.router, prefix="/api", tags=["Apps"])
 app.include_router(files.router, prefix="/api", tags=["Files"])
 

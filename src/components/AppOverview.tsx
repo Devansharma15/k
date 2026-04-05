@@ -173,8 +173,8 @@ export function AppOverview() {
                 Active AI surfaces
               </h2>
             </div>
-            <Link href="/apps/1" className="text-sm font-medium text-sky-300">
-              Open playground
+            <Link href="/integrations" className="text-sm font-medium text-sky-300">
+              Open integrations
             </Link>
           </div>
           <div className="mt-6 grid gap-4">

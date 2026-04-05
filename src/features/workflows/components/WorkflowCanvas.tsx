@@ -1,110 +1,173 @@
 "use client";
 
-import React, { useCallback, useMemo } from 'react';
-import ReactFlow, { 
-  addEdge, 
-  Background, 
-  Controls, 
-  MiniMap, 
-  useNodesState, 
+import { useCallback, useEffect, useMemo } from "react";
+import ReactFlow, {
+  addEdge,
+  Background,
+  BackgroundVariant,
+  Controls,
+  MiniMap,
+  type Connection,
+  type Edge,
+  type Node,
   useEdgesState,
-  Connection,
-  Edge,
-  Node,
-  BackgroundVariant
-} from 'reactflow';
-import 'reactflow/dist/style.css';
-import { LLMNode } from './nodes/LLMNode';
-import { ConditionNode } from './nodes/ConditionNode';
-import { cn } from '@/lib/utils';
+  useNodesState,
+} from "reactflow";
+import "reactflow/dist/style.css";
 
-const initialNodes: Node[] = [
-  { 
-    id: '1', 
-    type: 'llm', 
-    position: { x: 100, y: 100 }, 
-    data: { prompt: 'You are a professional copywriter...' } 
-  },
-  { 
-    id: '2', 
-    type: 'condition', 
-    position: { x: 500, y: 150 }, 
-    data: {} 
-  },
-];
+import type { WorkflowDefinition, WorkflowNodeType } from "@/lib/api";
+import { cn } from "@/lib/utils";
 
-const initialEdges: Edge[] = [
-  { id: 'e1-2', source: '1', target: '2', animated: true },
-];
+import { PlatformNode } from "./nodes/PlatformNode";
 
-export const WorkflowCanvas = () => {
+interface WorkflowCanvasProps {
+  snapshot: WorkflowDefinition;
+  nodeTypesCatalog: WorkflowNodeType[];
+  onSnapshotChange: (snapshot: WorkflowDefinition) => void;
+  onSelectNode?: (nodeId: string | null) => void;
+}
+
+export function WorkflowCanvas({
+  snapshot,
+  nodeTypesCatalog,
+  onSnapshotChange,
+  onSelectNode,
+}: WorkflowCanvasProps) {
+  const initialNodes = useMemo<Node[]>(
+    () =>
+      snapshot.nodes.map((node) => {
+        const catalog = nodeTypesCatalog.find((item) => item.type === node.type);
+        return {
+          id: node.id,
+          type: "platform",
+          position: node.position,
+          data: {
+            ...node,
+            label: catalog?.label ?? node.name,
+            family: catalog?.family ?? "core",
+            summary:
+              typeof node.config.prompt === "string"
+                ? node.config.prompt
+                : typeof node.config.expression === "string"
+                  ? node.config.expression
+                  : `${node.name} configuration`,
+          },
+        };
+      }),
+    [snapshot.nodes, nodeTypesCatalog],
+  );
+
+  const initialEdges = useMemo<Edge[]>(
+    () =>
+      snapshot.edges.map((edge) => ({
+        id: edge.id,
+        source: edge.source,
+        target: edge.target,
+        label: edge.condition,
+        animated: edge.condition === "true",
+        style: { strokeWidth: 2 },
+      })),
+    [snapshot.edges],
+  );
+
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  const nodeTypes = useMemo(() => ({
-    llm: LLMNode,
-    condition: ConditionNode,
-  }), []);
+  useEffect(() => setNodes(initialNodes), [initialNodes, setNodes]);
+  useEffect(() => setEdges(initialEdges), [initialEdges, setEdges]);
 
-  const onConnect = useCallback((params: Connection) => {
-    setEdges((eds) => addEdge({ ...params, animated: true, style: { stroke: '#3b82f6', strokeWidth: 2 } }, eds));
-  }, [setEdges]);
+  useEffect(() => {
+    onSnapshotChange({
+      ...snapshot,
+      nodes: nodes.map((node) => {
+        const original = snapshot.nodes.find((item) => item.id === node.id);
+        return {
+          ...(original ?? {
+            id: node.id,
+            type: "transform",
+            name: String(node.data?.label ?? "Node"),
+            config: {},
+            ai_brain: false,
+            memory: null,
+            retry_policy: { max_retries: 0, backoff: "none", retry_on: [] },
+            timeout_ms: 10000,
+          }),
+          position: node.position,
+        };
+      }),
+      edges: edges.map((edge) => {
+        const original = snapshot.edges.find((item) => item.id === edge.id);
+        return {
+          id: edge.id,
+          source: edge.source,
+          target: edge.target,
+          condition: String(original?.condition ?? edge.label ?? "true"),
+        };
+      }),
+    });
+  }, [edges, nodes, onSnapshotChange, snapshot]);
+
+  const onConnect = useCallback(
+    (params: Connection) => {
+      setEdges((current) =>
+        addEdge(
+          {
+            ...params,
+            id: `edge-${crypto.randomUUID()}`,
+            label: "true",
+            animated: true,
+            style: { strokeWidth: 2 },
+          },
+          current,
+        ),
+      );
+    },
+    [setEdges],
+  );
 
   return (
-    <div className="w-full h-full bg-background rounded-3xl overflow-hidden border border-border relative">
+    <div className="relative h-full w-full overflow-hidden rounded-[2rem] border border-border bg-background">
       <ReactFlow
         nodes={nodes}
         edges={edges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
-        nodeTypes={nodeTypes}
+        onPaneClick={() => onSelectNode?.(null)}
+        onNodeClick={(_, node) => onSelectNode?.(node.id)}
+        nodeTypes={{ platform: PlatformNode }}
         fitView
-        className="bg-zinc-950/50"
+        className="bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.04),_transparent_40%),linear-gradient(180deg,rgba(2,6,23,0.55),rgba(2,6,23,0.9))]"
       >
-        <Background color="#333" gap={20} variant={BackgroundVariant.Dots} />
-        <Controls className="bg-card border-border fill-foreground" />
-        <MiniMap 
-          className="bg-card border-border border rounded-xl overflow-hidden" 
-          maskColor="rgba(0,0,0,0.5)"
+        <Background color="#334155" gap={24} variant={BackgroundVariant.Dots} />
+        <Controls className="border border-border bg-card fill-foreground" />
+        <MiniMap
+          className="overflow-hidden rounded-xl border border-border bg-card"
+          maskColor="rgba(2, 6, 23, 0.55)"
           nodeColor={(node) => {
-            if (node.type === 'llm') return '#3b82f6';
-            if (node.type === 'condition') return '#eab308';
-            return '#333';
+            const family = node.data?.family;
+            if (family === "trigger") return "#10b981";
+            if (family === "ai") return "#8b5cf6";
+            if (family === "human") return "#f59e0b";
+            if (family === "integration") return "#f43f5e";
+            return "#38bdf8";
           }}
         />
       </ReactFlow>
-      
-      {/* Top Toolbar */}
-      <div className="absolute top-6 left-6 flex items-center gap-3 z-10">
-        <div className="glass px-4 py-2 rounded-xl flex items-center gap-4 shadow-2xl">
-          <div className="flex items-center gap-2 pr-4 border-r border-white/10">
-            <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-            <span className="text-[10px] font-bold uppercase text-muted-foreground whitespace-nowrap">Auto-save: ON</span>
-          </div>
-          <div className="flex items-center gap-2">
-             <button className="p-1 px-3 bg-primary text-primary-foreground text-[10px] font-bold rounded-lg hover:bg-primary/90 transition-all">PUBLISH</button>
-             <button className="p-1 px-3 bg-secondary text-secondary-foreground text-[10px] font-bold rounded-lg hover:bg-secondary/80 transition-all">DEBUG</button>
-          </div>
+
+      <div className="pointer-events-none absolute left-5 top-5 z-10">
+        <div className="glass rounded-2xl px-4 py-3 text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+          Live canvas editor
         </div>
       </div>
 
-      {/* Node Catalog Sidebar (Overlay) */}
-      <div className="absolute top-1/2 -translate-y-1/2 right-6 w-48 space-y-4 z-10 pointer-events-none">
-         <div className="glass p-4 rounded-3xl space-y-4 pointer-events-auto border-white/5 shadow-2xl">
-            <h4 className="text-[10px] font-bold text-muted-foreground uppercase text-center border-b border-white/5 pb-2">Node Catalog</h4>
-            <div className="space-y-2">
-               {['LLM', 'Condition', 'HTTP', 'Tool', 'Loop'].map(type => (
-                 <div key={type} className="p-3 bg-background/50 rounded-xl border border-white/5 flex items-center gap-3 cursor-grab active:cursor-grabbing hover:bg-accent transition-all group">
-                    <div className={cn("w-2 h-2 rounded-full", 
-                      type === 'LLM' ? 'bg-primary' : type === 'Condition' ? 'bg-yellow-500' : 'bg-muted-foreground'
-                    )} />
-                    <span className="text-[10px] font-bold">{type}</span>
-                 </div>
-               ))}
-            </div>
-         </div>
+      <div className="pointer-events-none absolute bottom-5 right-5 z-10">
+        <div className="glass rounded-2xl px-4 py-3 text-xs text-muted-foreground">
+          <span className={cn("font-semibold text-foreground")}>{nodes.length}</span> nodes
+          <span className="mx-2">•</span>
+          <span className={cn("font-semibold text-foreground")}>{edges.length}</span> edges
+        </div>
       </div>
     </div>
   );
-};
+}

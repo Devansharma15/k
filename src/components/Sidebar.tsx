@@ -8,7 +8,7 @@ import {
   MessageSquare, 
   Workflow, 
   Database, 
-  Terminal, 
+  Plug, 
   BarChart3, 
   Settings,
   ChevronLeft,
@@ -24,7 +24,7 @@ const navItems = [
   { name: 'Apps', icon: MessageSquare, href: '/apps' },
   { name: 'Workflows', icon: Workflow, href: '/workflows' },
   { name: 'Knowledge Base', icon: Database, href: '/knowledge-base' },
-  { name: 'Playground', icon: Terminal, href: '/playground' },
+  { name: 'Integrations', icon: Plug, href: '/integrations' },
   { name: 'Logs', icon: BarChart3, href: '/logs' },
   { name: 'Settings', icon: Settings, href: '/settings' },
 ];
