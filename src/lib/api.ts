@@ -323,6 +323,55 @@ export interface WorkflowTemplate {
   description: string;
   integrations_required: string[];
   workflow_snapshot: WorkflowDefinition;
+  source?: "system" | "custom";
+  owner_user_id?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface WorkflowTemplateVersion {
+  id: string;
+  template_id: string;
+  version_number: number;
+  change_summary: string;
+  created_at: string;
+  created_by: string;
+}
+
+export interface WorkflowLimits {
+  workspace_id: string;
+  max_nodes: number;
+  max_depth: number;
+  max_execution_time_ms: number;
+  max_retries_total: number;
+  max_sub_workflow_depth: number;
+}
+
+export interface AutosaveDraft {
+  id: string;
+  entity_type: string;
+  entity_id: string;
+  snapshot: WorkflowDefinition;
+  saved_at: string;
+}
+
+export interface GeneratedWorkflowResponse extends WorkflowDefinition {
+  explanation?: string;
+  missing_integrations?: string[];
+  confidence?: number;
+  needs_confirmation?: boolean;
+  plan_confidence?: number;
+  parse_confidence?: number;
+}
+
+export interface VersionComparisonResult {
+  v1: { version_number: number; created_at: string };
+  v2: { version_number: number; created_at: string };
+  nodes_added: string[];
+  nodes_removed: string[];
+  nodes_unchanged: string[];
+  v1_node_count: number;
+  v2_node_count: number;
 }
 
 export interface ApprovalTask {
@@ -374,6 +423,8 @@ export const apiRoutes = {
   workflowApprovals: `${API_BASE_URL}/api/approvals`,
   workflowUsage: `${API_BASE_URL}/api/usage/llm`,
   workflowGenerate: `${API_BASE_URL}/api/generate-workflow`,
+  workflowLimits: `${API_BASE_URL}/api/workflow-limits`,
+  workflowAutosave: `${API_BASE_URL}/api/autosave`,
 };
 
 export async function getOverview(): Promise<OverviewData> {
@@ -785,6 +836,110 @@ export async function listWorkflowUsage(): Promise<LlmUsageRecord[]> {
 
 export async function generateWorkflowFromPrompt(
   prompt: string,
-): Promise<WorkflowDefinition> {
-  return postJson<WorkflowDefinition>(apiRoutes.workflowGenerate, { prompt });
+): Promise<GeneratedWorkflowResponse> {
+  return postJson<GeneratedWorkflowResponse>(apiRoutes.workflowGenerate, { prompt });
+}
+
+// ── Template CRUD ─────────────────────────────────────────────────
+
+export async function createWorkflowTemplate(
+  name: string,
+  category: string,
+  difficulty: string,
+  description: string,
+  integrations: string[],
+  snapshot: WorkflowDefinition,
+): Promise<WorkflowTemplate> {
+  return postJson<WorkflowTemplate>(apiRoutes.workflowTemplates, {
+    name, category, difficulty, description,
+    integrations_required: integrations, snapshot,
+  });
+}
+
+export async function updateWorkflowTemplate(
+  templateId: string,
+  name: string,
+  snapshot: WorkflowDefinition,
+  changeSummary = "",
+): Promise<WorkflowTemplate> {
+  return postJson<WorkflowTemplate>(
+    `${apiRoutes.workflowTemplates}/${templateId}`,
+    { name, snapshot, change_summary: changeSummary },
+  );
+}
+
+export async function deleteWorkflowTemplate(
+  templateId: string,
+): Promise<{ deleted: boolean }> {
+  const response = await fetch(`${apiRoutes.workflowTemplates}/${templateId}`, { method: "DELETE" });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Delete failed.");
+  }
+  return (await response.json()) as { deleted: boolean };
+}
+
+export async function listTemplateVersions(
+  templateId: string,
+): Promise<WorkflowTemplateVersion[]> {
+  const response = await fetch(`${apiRoutes.workflowTemplates}/${templateId}/versions`);
+  if (!response.ok) throw new Error("Failed to load template versions.");
+  return (await response.json()) as WorkflowTemplateVersion[];
+}
+
+export async function rollbackWorkflowTemplate(
+  templateId: string,
+  versionId: string,
+): Promise<WorkflowTemplate> {
+  return postJson<WorkflowTemplate>(
+    `${apiRoutes.workflowTemplates}/${templateId}/rollback/${versionId}`, {},
+  );
+}
+
+export async function compareTemplateVersions(
+  templateId: string,
+  v1Id: string,
+  v2Id: string,
+): Promise<VersionComparisonResult> {
+  const response = await fetch(
+    `${apiRoutes.workflowTemplates}/${templateId}/compare/${v1Id}/${v2Id}`,
+  );
+  if (!response.ok) throw new Error("Failed to compare versions.");
+  return (await response.json()) as VersionComparisonResult;
+}
+
+// ── Workflow Limits ─────────────────────────────────────────────
+
+export async function getWorkflowLimits(): Promise<WorkflowLimits> {
+  const response = await fetch(apiRoutes.workflowLimits);
+  if (!response.ok) throw new Error("Failed to load workflow limits.");
+  return (await response.json()) as WorkflowLimits;
+}
+
+export async function updateWorkflowLimits(
+  limits: Partial<WorkflowLimits>,
+): Promise<WorkflowLimits> {
+  return postJson<WorkflowLimits>(apiRoutes.workflowLimits, limits as Record<string, unknown>);
+}
+
+// ── Autosave ─────────────────────────────────────────────────────
+
+export async function autosaveWorkflowDraft(
+  entityType: string,
+  entityId: string,
+  snapshot: WorkflowDefinition,
+): Promise<AutosaveDraft> {
+  return postJson<AutosaveDraft>(apiRoutes.workflowAutosave, {
+    entity_type: entityType, entity_id: entityId, snapshot,
+  });
+}
+
+export async function getAutosaveDraft(
+  entityType: string,
+  entityId: string,
+): Promise<AutosaveDraft | null> {
+  const response = await fetch(`${apiRoutes.workflowAutosave}/${entityType}/${entityId}`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error("Failed to load autosave draft.");
+  return (await response.json()) as AutosaveDraft;
 }

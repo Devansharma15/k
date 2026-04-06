@@ -673,8 +673,55 @@ class WorkflowPlatformService:
                     integrations_required TEXT NOT NULL,
                     workflow_snapshot TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS template_versions (
+                    id TEXT PRIMARY KEY,
+                    template_id TEXT NOT NULL,
+                    version_number INTEGER NOT NULL,
+                    json_snapshot TEXT NOT NULL,
+                    change_summary TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    UNIQUE(template_id, version_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS workflow_limits (
+                    workspace_id TEXT PRIMARY KEY,
+                    max_nodes INTEGER NOT NULL DEFAULT 100,
+                    max_depth INTEGER NOT NULL DEFAULT 50,
+                    max_execution_time_ms INTEGER NOT NULL DEFAULT 300000,
+                    max_retries_total INTEGER NOT NULL DEFAULT 20,
+                    max_sub_workflow_depth INTEGER NOT NULL DEFAULT 5
+                );
+
+                CREATE TABLE IF NOT EXISTS autosave_drafts (
+                    id TEXT PRIMARY KEY,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    saved_at TEXT NOT NULL
+                );
                 """
             )
+            self._migrate_schema(connection)
+
+    def _migrate_schema(self, connection: sqlite3.Connection) -> None:
+        """Add columns to existing tables if missing (safe idempotent migrations)."""
+        migrations = [
+            ("templates", "source", "TEXT NOT NULL DEFAULT 'system'"),
+            ("templates", "owner_user_id", "TEXT"),
+            ("templates", "trigger_config", "TEXT NOT NULL DEFAULT '{}'"),
+            ("templates", "created_at", "TEXT"),
+            ("templates", "updated_at", "TEXT"),
+            ("templates", "created_by", "TEXT"),
+            ("templates", "updated_by", "TEXT"),
+            ("workflow_versions", "change_summary", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        for table, column, col_type in migrations:
+            try:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            except Exception:
+                pass  # Column already exists
 
     def _seed_templates(self) -> None:
         with self._connect() as connection:
@@ -710,6 +757,312 @@ class WorkflowPlatformService:
                         json.dumps(workflow_snapshot),
                     ),
                 )
+
+    # ── Execution Context Engine ──────────────────────────────────────
+
+    def _build_execution_context(
+        self,
+        run_id: str,
+        workflow_id: str,
+        mode: str,
+        debug: bool,
+        input_data: dict[str, Any],
+        version_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "input": input_data,
+            "node_outputs": {},
+            "global_vars": {
+                "mode": mode,
+                "workflow_id": workflow_id,
+                "debug": debug,
+            },
+            "variables": {},
+            "metadata": {
+                "run_id": run_id,
+                "version_id": version_id,
+                "started_at": _utc_now(),
+                "step_count": 0,
+                "deadline_ms": None,
+            },
+        }
+
+    # ── Structured Condition Evaluator ────────────────────────────────
+
+    def evaluate_structured_condition(self, condition: dict[str, Any] | str, scope: dict[str, Any]) -> bool:
+        """Evaluate a condition — supports both legacy string and structured JSON."""
+        if isinstance(condition, str):
+            return self._safe_eval_expression(condition, scope)
+        left_raw = condition.get("left", "")
+        operator = condition.get("operator", "==")
+        right_raw = condition.get("right", "")
+        left = self._resolve_condition_value(left_raw, scope)
+        right = self._resolve_condition_value(right_raw, scope)
+        return self._apply_operator(left, operator, right)
+
+    def _resolve_condition_value(self, value: Any, scope: dict[str, Any]) -> Any:
+        if isinstance(value, str) and value.startswith("{{") and value.endswith("}}"):
+            token = value[2:-2].strip()
+            parts = token.split(".")
+            current = scope
+            for part in parts:
+                if isinstance(current, dict):
+                    current = current.get(part)
+                else:
+                    return None
+            return current
+        return value
+
+    def _apply_operator(self, left: Any, operator: str, right: Any) -> bool:
+        try:
+            if operator == "==":
+                return left == right
+            if operator == "!=":
+                return left != right
+            if operator == ">":
+                return float(left) > float(right)
+            if operator == ">=":
+                return float(left) >= float(right)
+            if operator == "<":
+                return float(left) < float(right)
+            if operator == "<=":
+                return float(left) <= float(right)
+            if operator == "contains":
+                return str(right) in str(left)
+            if operator == "not_contains":
+                return str(right) not in str(left)
+            if operator == "is_empty":
+                return left in (None, "", [], {})
+            if operator == "is_not_empty":
+                return left not in (None, "", [], {})
+            if operator == "matches":
+                return bool(re.search(str(right), str(left)))
+            if operator == "in":
+                return left in (right if isinstance(right, list) else [right])
+        except (TypeError, ValueError):
+            return False
+        return False
+
+    # ── Workflow Limits ───────────────────────────────────────────────
+
+    def get_workflow_limits(self, workspace_id: str = DEFAULT_WORKSPACE_ID) -> dict[str, int]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_limits WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+        if row:
+            return dict(row)
+        return {
+            "workspace_id": workspace_id,
+            "max_nodes": 100,
+            "max_depth": 50,
+            "max_execution_time_ms": 300000,
+            "max_retries_total": 20,
+            "max_sub_workflow_depth": 5,
+        }
+
+    def update_workflow_limits(self, limits: dict[str, Any], workspace_id: str = DEFAULT_WORKSPACE_ID) -> dict[str, int]:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO workflow_limits (workspace_id, max_nodes, max_depth, max_execution_time_ms, max_retries_total, max_sub_workflow_depth)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_id) DO UPDATE SET
+                    max_nodes = excluded.max_nodes,
+                    max_depth = excluded.max_depth,
+                    max_execution_time_ms = excluded.max_execution_time_ms,
+                    max_retries_total = excluded.max_retries_total,
+                    max_sub_workflow_depth = excluded.max_sub_workflow_depth
+                """,
+                (
+                    workspace_id,
+                    limits.get("max_nodes", 100),
+                    limits.get("max_depth", 50),
+                    limits.get("max_execution_time_ms", 300000),
+                    limits.get("max_retries_total", 20),
+                    limits.get("max_sub_workflow_depth", 5),
+                ),
+            )
+        return self.get_workflow_limits(workspace_id)
+
+    def _enforce_limits_on_snapshot(self, snapshot: dict[str, Any]) -> None:
+        limits = self.get_workflow_limits()
+        nodes = snapshot.get("nodes", [])
+        if len(nodes) > limits["max_nodes"]:
+            raise ValueError(f"Workflow exceeds max node limit ({len(nodes)}/{limits['max_nodes']}).")
+        depth = self._compute_graph_depth(snapshot)
+        if depth > limits["max_depth"]:
+            raise ValueError(f"Workflow graph depth {depth} exceeds limit {limits['max_depth']}.")
+
+    def _compute_graph_depth(self, snapshot: dict[str, Any]) -> int:
+        nodes = snapshot.get("nodes", [])
+        edges = snapshot.get("edges", [])
+        if not nodes:
+            return 0
+        adj: dict[str, list[str]] = {n["id"]: [] for n in nodes}
+        incoming: dict[str, int] = {n["id"]: 0 for n in nodes}
+        for e in edges:
+            adj[e["source"]].append(e["target"])
+            incoming[e["target"]] = incoming.get(e["target"], 0) + 1
+        roots = [nid for nid, count in incoming.items() if count == 0]
+        if not roots:
+            return len(nodes)
+        max_depth = 0
+        queue: list[tuple[str, int]] = [(r, 1) for r in roots]
+        visited: set[str] = set()
+        while queue:
+            nid, depth = queue.pop(0)
+            if nid in visited:
+                continue
+            visited.add(nid)
+            max_depth = max(max_depth, depth)
+            for child in adj.get(nid, []):
+                queue.append((child, depth + 1))
+        return max_depth
+
+    # ── Template CRUD ─────────────────────────────────────────────────
+
+    def create_template(
+        self, name: str, category: str, difficulty: str, description: str,
+        integrations_required: list[str], snapshot: dict[str, Any],
+        user_id: str = DEFAULT_USER_ID,
+    ) -> dict[str, Any]:
+        template_id = f"tpl_{uuid4().hex}"
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO templates (
+                    id, name, category, difficulty, description, integrations_required,
+                    workflow_snapshot, source, owner_user_id, trigger_config,
+                    created_at, updated_at, created_by, updated_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    template_id, name, category, difficulty, description,
+                    json.dumps(integrations_required), json.dumps(snapshot),
+                    "custom", user_id, "{}",
+                    now, now, user_id, user_id,
+                ),
+            )
+        return self.get_template(template_id)
+
+    def get_template(self, template_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM templates WHERE id = ?", (template_id,)).fetchone()
+        if not row:
+            raise ValueError("Template not found.")
+        item = dict(row)
+        item["integrations_required"] = json.loads(item["integrations_required"])
+        item["workflow_snapshot"] = json.loads(item["workflow_snapshot"])
+        if item.get("trigger_config"):
+            item["trigger_config"] = json.loads(item["trigger_config"])
+        return item
+
+    def update_template(
+        self, template_id: str, name: str, snapshot: dict[str, Any],
+        user_id: str = DEFAULT_USER_ID, change_summary: str = "",
+    ) -> dict[str, Any]:
+        template = self.get_template(template_id)
+        if template.get("source") == "system":
+            raise ValueError("System templates cannot be modified. Clone to custom first.")
+        now = _utc_now()
+        with self._connect() as connection:
+            # Save version before updating
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(version_number), 0) AS latest FROM template_versions WHERE template_id = ?",
+                (template_id,),
+            ).fetchone()["latest"]
+            connection.execute(
+                """
+                INSERT INTO template_versions (id, template_id, version_number, json_snapshot, change_summary, created_at, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (f"tv_{uuid4().hex}", template_id, latest + 1, json.dumps(template["workflow_snapshot"]), change_summary, now, user_id),
+            )
+            connection.execute(
+                "UPDATE templates SET name = ?, workflow_snapshot = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+                (name, json.dumps(snapshot), now, user_id, template_id),
+            )
+        return self.get_template(template_id)
+
+    def delete_template(self, template_id: str) -> dict[str, bool]:
+        template = self.get_template(template_id)
+        if template.get("source") == "system":
+            raise ValueError("System templates cannot be deleted.")
+        with self._connect() as connection:
+            connection.execute("DELETE FROM template_versions WHERE template_id = ?", (template_id,))
+            connection.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+        return {"deleted": True}
+
+    def list_template_versions(self, template_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, template_id, version_number, change_summary, created_at, created_by FROM template_versions WHERE template_id = ? ORDER BY version_number DESC",
+                (template_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def rollback_template(self, template_id: str, version_id: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        with self._connect() as connection:
+            version = connection.execute(
+                "SELECT json_snapshot FROM template_versions WHERE template_id = ? AND id = ?",
+                (template_id, version_id),
+            ).fetchone()
+            if not version:
+                raise ValueError("Template version not found.")
+            connection.execute(
+                "UPDATE templates SET workflow_snapshot = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+                (version["json_snapshot"], _utc_now(), user_id, template_id),
+            )
+        return self.get_template(template_id)
+
+    def compare_template_versions(self, template_id: str, v1_id: str, v2_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            v1 = connection.execute("SELECT * FROM template_versions WHERE id = ? AND template_id = ?", (v1_id, template_id)).fetchone()
+            v2 = connection.execute("SELECT * FROM template_versions WHERE id = ? AND template_id = ?", (v2_id, template_id)).fetchone()
+        if not v1 or not v2:
+            raise ValueError("One or both versions not found.")
+        snap1 = json.loads(v1["json_snapshot"])
+        snap2 = json.loads(v2["json_snapshot"])
+        nodes1_ids = {n["id"] for n in snap1.get("nodes", [])}
+        nodes2_ids = {n["id"] for n in snap2.get("nodes", [])}
+        return {
+            "v1": {"version_number": v1["version_number"], "created_at": v1["created_at"]},
+            "v2": {"version_number": v2["version_number"], "created_at": v2["created_at"]},
+            "nodes_added": list(nodes2_ids - nodes1_ids),
+            "nodes_removed": list(nodes1_ids - nodes2_ids),
+            "nodes_unchanged": list(nodes1_ids & nodes2_ids),
+            "v1_node_count": len(nodes1_ids),
+            "v2_node_count": len(nodes2_ids),
+        }
+
+    # ── Autosave ──────────────────────────────────────────────────────
+
+    def autosave_draft(self, entity_type: str, entity_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        draft_id = f"autosave_{entity_type}_{entity_id}"
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO autosave_drafts (id, entity_type, entity_id, snapshot, saved_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET snapshot = excluded.snapshot, saved_at = excluded.saved_at
+                """,
+                (draft_id, entity_type, entity_id, json.dumps(snapshot), now),
+            )
+        return {"id": draft_id, "saved_at": now}
+
+    def get_autosave_draft(self, entity_type: str, entity_id: str) -> dict[str, Any] | None:
+        draft_id = f"autosave_{entity_type}_{entity_id}"
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM autosave_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["snapshot"] = json.loads(item["snapshot"])
+        return item
 
     def list_workflows(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -807,6 +1160,8 @@ class WorkflowPlatformService:
         node_ids = {node.get("id") for node in nodes}
         if not nodes:
             raise ValueError("Workflow must include at least one node.")
+        # Enforce workflow limits
+        self._enforce_limits_on_snapshot(snapshot)
         node_type_map = {item["type"]: item for item in NODE_TYPES}
         errors: list[dict[str, str]] = []
         for node in nodes:
@@ -844,13 +1199,18 @@ class WorkflowPlatformService:
         for edge in edges:
             if edge.get("source") not in node_ids or edge.get("target") not in node_ids:
                 raise ValueError("Edges must connect valid nodes.")
-            if edge.get("condition") is None:
+            condition = edge.get("condition")
+            if condition is None:
                 raise ValueError("Every edge must define a condition.")
-            self._validate_safe_expression(str(edge.get("condition", "true")))
+            # Support both string and structured conditions
+            if isinstance(condition, str):
+                self._validate_safe_expression(condition)
+            # Structured dict conditions are inherently safe (no eval)
         for node in nodes:
             if node.get("type") == "condition":
-                expression = str((node.get("config") or {}).get("expression", "True"))
-                self._validate_safe_expression(expression)
+                expression = (node.get("config") or {}).get("expression", "True")
+                if isinstance(expression, str):
+                    self._validate_safe_expression(expression)
         self._detect_cycles(nodes, edges)
         return {"valid": len(errors) == 0, "nodes": len(nodes), "edges": len(edges), "errors": errors}
 
@@ -1078,15 +1438,18 @@ class WorkflowPlatformService:
             first = validation["errors"][0]
             raise ValueError(f"{first['node_id']}: {first['message']}")
         run_id = f"run_{uuid4().hex}"
-        context = {
-            "input": input_data or {},
-            "node_outputs": {},
-            "global_vars": {
-                "mode": mode,
-                "workflow_id": workflow_id,
-                "debug": debug,
-            },
-        }
+        context = self._build_execution_context(
+            run_id, workflow_id, mode, debug, input_data or {}, workflow_version_id,
+        )
+        # Enforce sub-workflow nesting depth
+        if parent_run_id:
+            limits = self.get_workflow_limits()
+            depth = self._get_sub_workflow_depth(parent_run_id)
+            if depth >= limits["max_sub_workflow_depth"]:
+                raise ValueError(f"Sub-workflow nesting depth {depth} exceeds limit {limits['max_sub_workflow_depth']}.")
+        # Set execution deadline
+        limits = self.get_workflow_limits()
+        context["metadata"]["deadline_ms"] = limits["max_execution_time_ms"]
         now = _utc_now()
         with self._connect() as connection:
             connection.execute(
@@ -1199,15 +1562,45 @@ class WorkflowPlatformService:
         queue = [node_id for node_id, parents in incoming.items() if not parents]
         processed: set[str] = set()
         final_output: dict[str, Any] = {}
+        max_steps = 500
+        start_time = time.time()
+        deadline_ms = context.get("metadata", {}).get("deadline_ms") or 300000
 
         while queue:
             node_id = queue.pop(0)
             if node_id in processed:
                 continue
+            # Enforce step limit
+            context["metadata"]["step_count"] = context.get("metadata", {}).get("step_count", 0) + 1
+            if context["metadata"]["step_count"] > max_steps:
+                raise ValueError(f"Execution exceeded max step limit ({max_steps}).")
+            # Enforce deadline
+            elapsed_ms = (time.time() - start_time) * 1000
+            if elapsed_ms > deadline_ms:
+                raise ValueError(f"Execution exceeded time limit ({deadline_ms}ms).")
+
             node = nodes[node_id]
             node_input = self._resolve_node_input(node_id, incoming[node_id], context)
             mapped_input = self._resolve_input_mapping(node, node_input, context)
-            result = self._execute_node(run_id, workflow_id, node, mapped_input, context, mode, debug)
+
+            # Execute with on_error fallback support
+            on_error = node.get("on_error") or {}
+            try:
+                result = self._execute_node(run_id, workflow_id, node, mapped_input, context, mode, debug)
+            except PauseIteration:
+                raise
+            except Exception as exec_err:
+                strategy = on_error.get("strategy", "fail")
+                if strategy == "skip":
+                    result = None
+                elif strategy in {"fallback", "retry_then_fallback"}:
+                    fallback_id = on_error.get("fallback_node_id")
+                    if fallback_id and fallback_id in nodes:
+                        queue.append(fallback_id)
+                    result = None
+                else:
+                    raise
+
             normalized_result = self._apply_output_mapping(node, result, context, mapped_input)
             if result is not None:
                 context["node_outputs"][node_id] = normalized_result
@@ -1291,13 +1684,33 @@ class WorkflowPlatformService:
         node_result: Any,
         context: dict[str, Any],
     ) -> bool:
-        condition = str(edge.get("condition", "true")).strip()
-        if condition == "true":
+        condition = edge.get("condition", "true")
+        # Support structured condition objects
+        if isinstance(condition, dict):
+            scope = self._build_expression_scope(node_result, context, context["input"])
+            return self.evaluate_structured_condition(condition, scope)
+        condition_str = str(condition).strip()
+        if condition_str == "true":
             return True
-        if condition == "false":
+        if condition_str == "false":
             return False
         scope = self._build_expression_scope(node_result, context, context["input"])
-        return self._safe_eval_expression(condition, scope)
+        return self._safe_eval_expression(condition_str, scope)
+
+    def _get_sub_workflow_depth(self, run_id: str) -> int:
+        depth = 0
+        current_id = run_id
+        with self._connect() as connection:
+            while current_id:
+                row = connection.execute(
+                    "SELECT parent_run_id FROM workflow_runs WHERE id = ?",
+                    (current_id,),
+                ).fetchone()
+                if not row or not row["parent_run_id"]:
+                    break
+                depth += 1
+                current_id = row["parent_run_id"]
+        return depth
 
     def _execute_node(
         self,

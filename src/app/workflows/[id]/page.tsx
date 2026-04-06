@@ -1,33 +1,45 @@
 "use client";
 
-import { use, useEffect, useMemo, useState } from "react";
+import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertTriangle,
   Bot,
   ChevronDown,
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
+  Clock,
   Download,
+  GitBranch,
+  History,
   Play,
+  RotateCcw,
   Save,
+  Shield,
   Sparkles,
 } from "lucide-react";
 
 import { WorkflowCanvas } from "@/features/workflows/components/WorkflowCanvas";
 import {
+  autosaveWorkflowDraft,
   generateWorkflowFromPrompt,
+  getWorkflowLimits,
   getPlatformRunLogs,
   getPlatformWorkflow,
+  listPlatformVersions,
   listWorkflowNodeTypes,
   publishPlatformWorkflow,
+  rollbackPlatformWorkflow,
   runPlatformWorkflow,
   updatePlatformWorkflow,
   validatePlatformWorkflow,
+  type GeneratedWorkflowResponse,
   type WorkflowDefinition,
   type WorkflowNodeDefinition,
   type WorkflowNodeType,
   type WorkflowRunLogsResponse,
+  type WorkflowVersionRecord,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -101,6 +113,11 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [activeFieldKey, setActiveFieldKey] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [generationConfidence, setGenerationConfidence] = useState<number | null>(null);
+  const [generationExplanation, setGenerationExplanation] = useState<string | null>(null);
+  const [autosaveStatus, setAutosaveStatus] = useState<"idle" | "saving" | "saved">("idle");
+  const [showVersions, setShowVersions] = useState(false);
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const workflowQuery = useQuery({
     queryKey: ["platform-workflow", id],
@@ -124,6 +141,17 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
       if (status && ["completed", "failed", "cancelled"].includes(status)) return false;
       return 1500;
     },
+  });
+
+  const versionsQuery = useQuery({
+    queryKey: ["workflow-versions", id],
+    queryFn: () => listPlatformVersions(id),
+    enabled: showVersions,
+  });
+
+  const limitsQuery = useQuery({
+    queryKey: ["workflow-limits"],
+    queryFn: getWorkflowLimits,
   });
 
   useEffect(() => {
@@ -232,13 +260,52 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
     onMutate: () => {
       setActiveRunId(null);
     },
-    onSuccess: (generated) => {
+    onSuccess: (generated: GeneratedWorkflowResponse) => {
       setDraft(generated);
       setName(generated.name);
-      setFeedback("Prompt converted into workflow draft.");
+      setGenerationConfidence(generated.confidence ?? null);
+      setGenerationExplanation(generated.explanation ?? null);
+      const confLabel = generated.confidence != null ? ` (confidence: ${Math.round(generated.confidence * 100)}%)` : "";
+      setFeedback(`Prompt converted into workflow draft.${confLabel}`);
+      if (generated.needs_confirmation) {
+        setFeedback(`Low confidence generation${confLabel}. Please review carefully before running.`);
+      }
     },
     onError: (e: Error) => setFeedback(e.message),
   });
+
+  const rollbackMutation = useMutation({
+    mutationFn: (versionId: string) => rollbackPlatformWorkflow(id, versionId),
+    onSuccess: async () => {
+      setFeedback("Rolled back to selected version.");
+      await invalidateWorkflow();
+    },
+    onError: (e: Error) => setFeedback(e.message),
+  });
+
+  // ── Autosave ───────────────────────────────────────────────────
+  const performAutosave = useCallback(async () => {
+    if (isLocked || effectiveDraft.nodes.length === 0) return;
+    setAutosaveStatus("saving");
+    try {
+      await autosaveWorkflowDraft("workflow", id, effectiveDraft);
+      setAutosaveStatus("saved");
+    } catch {
+      setAutosaveStatus("idle");
+    }
+  }, [id, isLocked, effectiveDraft]);
+
+  useEffect(() => {
+    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    if (effectiveDraft.nodes.length === 0) return;
+    setAutosaveStatus("idle");
+    autosaveTimerRef.current = setTimeout(() => {
+      void performAutosave();
+    }, 5000);
+    return () => {
+      if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    };
+  }, [effectiveDraft, performAutosave]);
 
   const addNode = (nodeType: WorkflowNodeType) => {
     if (isLocked) return;
@@ -395,6 +462,44 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
               disabled={isLocked}
               className="ml-auto h-10 min-w-[220px] rounded-full border border-border bg-card px-4 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-60"
             />
+            <button
+              onClick={() => setShowVersions((v) => !v)}
+              className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-2 text-xs font-semibold"
+            >
+              <History className="h-4 w-4" />
+              Versions
+            </button>
+          </div>
+
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            {autosaveStatus !== "idle" ? (
+              <span className={cn(
+                "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
+                autosaveStatus === "saving" ? "border border-amber-400/30 bg-amber-500/10 text-amber-300" : "border border-emerald-400/30 bg-emerald-500/10 text-emerald-300",
+              )}>
+                {autosaveStatus === "saving" ? "Autosaving..." : "Autosaved"}
+              </span>
+            ) : null}
+            {generationConfidence != null ? (
+              <span className={cn(
+                "inline-flex items-center gap-1 rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
+                generationConfidence >= 0.7 ? "border border-emerald-400/30 bg-emerald-500/10 text-emerald-300" :
+                generationConfidence >= 0.4 ? "border border-amber-400/30 bg-amber-500/10 text-amber-300" :
+                "border border-rose-400/30 bg-rose-500/10 text-rose-300",
+              )}>
+                <Shield className="h-3 w-3" />
+                Confidence: {Math.round(generationConfidence * 100)}%
+              </span>
+            ) : null}
+            {limitsQuery.data ? (
+              <span className={cn(
+                "inline-flex items-center gap-1 rounded-full border border-border bg-card px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground",
+                effectiveDraft.nodes.length > (limitsQuery.data.max_nodes * 0.8) && "border-amber-400/40 text-amber-300",
+              )}>
+                <GitBranch className="h-3 w-3" />
+                {effectiveDraft.nodes.length}/{limitsQuery.data.max_nodes} nodes
+              </span>
+            ) : null}
           </div>
 
           {isLocked ? (
@@ -405,6 +510,12 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
           {feedback ? (
             <p className="mt-3 rounded-xl border border-border bg-card px-3 py-2 text-sm text-muted-foreground">
               {feedback}
+            </p>
+          ) : null}
+          {generationExplanation ? (
+            <p className="mt-2 rounded-xl border border-violet-500/20 bg-violet-500/5 px-3 py-2 text-xs text-violet-300">
+              <Sparkles className="mr-1 inline h-3 w-3" />
+              {generationExplanation}
             </p>
           ) : null}
         </div>
@@ -603,6 +714,30 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
                       ))}
                     </div>
                   ) : null}
+                  {/* Error Handling Config */}
+                  <div className="rounded-xl border border-border bg-card p-3">
+                    <p className="text-xs uppercase tracking-[0.14em] text-muted-foreground">
+                      <AlertTriangle className="mr-1 inline h-3 w-3" />
+                      Error Handling
+                    </p>
+                    <select
+                      value={String((selectedNode.config as Record<string, unknown>)?.on_error_strategy ?? "fail")}
+                      onChange={(e) =>
+                        updateSelectedNode((node) => ({
+                          ...node,
+                          config: { ...node.config, on_error_strategy: e.target.value },
+                        }))
+                      }
+                      disabled={isLocked}
+                      className="mt-2 h-9 w-full rounded-lg border border-border bg-card px-3 text-xs outline-none"
+                    >
+                      <option value="fail">Fail (default)</option>
+                      <option value="retry">Retry</option>
+                      <option value="skip">Skip</option>
+                      <option value="fallback">Fallback to node</option>
+                      <option value="retry_then_fallback">Retry then fallback</option>
+                    </select>
+                  </div>
                 </div>
               ) : (
                 <p className="mt-2 text-sm text-muted-foreground">Select a node to edit settings.</p>
@@ -622,7 +757,7 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
                   ))}
                 </div>
               ) : null}
-              <div className="mt-3 max-h-[42vh] space-y-2 overflow-y-auto rounded-xl border border-border bg-card p-3">
+              <div className="mt-3 max-h-[28vh] space-y-2 overflow-y-auto rounded-xl border border-border bg-card p-3">
                 {(runLogsQuery.data?.logs ?? []).length ? (
                   (runLogsQuery.data?.logs ?? []).map((log, index) => (
                     <div key={`${log.node_id}-${log.timestamp}-${index}`} className="rounded-lg border border-border p-2 text-xs">
@@ -640,6 +775,45 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
                 )}
               </div>
             </div>
+
+            {/* Version History Panel */}
+            {showVersions ? (
+              <div className="rounded-2xl border border-border bg-background/80 p-3">
+                <div className="flex items-center gap-2">
+                  <History className="h-4 w-4 text-muted-foreground" />
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                    Version History
+                  </p>
+                </div>
+                <div className="mt-3 max-h-[20vh] space-y-2 overflow-y-auto">
+                  {(versionsQuery.data ?? []).length ? (
+                    (versionsQuery.data ?? []).map((version) => (
+                      <div
+                        key={version.id}
+                        className="flex items-center justify-between rounded-lg border border-border p-2 text-xs"
+                      >
+                        <div>
+                          <p className="font-semibold text-foreground">v{version.version_number}</p>
+                          <p className="text-[10px] text-muted-foreground">
+                            {new Date(version.created_at).toLocaleString()}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => rollbackMutation.mutate(version.id)}
+                          disabled={rollbackMutation.isPending}
+                          className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-1 text-[10px] font-semibold text-muted-foreground hover:border-primary/40 hover:text-foreground"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                          Rollback
+                        </button>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-xs text-muted-foreground">No versions published yet.</p>
+                  )}
+                </div>
+              </div>
+            ) : null}
           </div>
         </aside>
       </main>
