@@ -104,9 +104,7 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
   const qc = useQueryClient();
   const [draft, setDraft] = useState(emptySnapshot);
   const [name, setName] = useState("");
-  const [prompt, setPrompt] = useState(
-    "Send Slack message when new Stripe payment is received and store in Notion",
-  );
+  const [prompt, setPrompt] = useState("");
   const [feedback, setFeedback] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [familyOpen, setFamilyOpen] = useState<Record<string, boolean>>({});
@@ -762,7 +760,7 @@ export default function WorkflowPage({ params }: { params: Promise<{ id: string 
                   (runLogsQuery.data?.logs ?? []).map((log, index) => (
                     <div key={`${log.node_id}-${log.timestamp}-${index}`} className="rounded-lg border border-border p-2 text-xs">
                       <p className="font-semibold text-foreground">
-                        [{log.node_id}] {log.status}
+                        [{log.node_type}] {log.node_id} - {log.status}
                       </p>
                       <p className="mt-1 text-muted-foreground">{log.message}</p>
                       <p className="mt-1 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">

@@ -78,7 +78,7 @@ async def get_document_file(
             document_id=document_id,
             user_id=user_id,
         )
-        return FileResponse(path, media_type="application/pdf", filename=path.name)
+        return FileResponse(path, media_type="application/pdf", filename=path.name, content_disposition_type="inline")
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

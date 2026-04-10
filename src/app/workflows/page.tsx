@@ -7,20 +7,8 @@ import { useRouter } from "next/navigation";
 import { createPlatformWorkflow, listPlatformWorkflows, type WorkflowDefinition } from "@/lib/api";
 
 const starterSnapshot: WorkflowDefinition = {
-  name: "Workflow Studio",
-  nodes: [
-    {
-      id: "trigger-1",
-      type: "trigger_webhook",
-      name: "Webhook Trigger",
-      position: { x: 120, y: 180 },
-      config: { path: "/webhooks/new-flow" },
-      ai_brain: false,
-      memory: null,
-      retry_policy: { max_retries: 0, backoff: "none", retry_on: [] },
-      timeout_ms: 5000,
-    },
-  ],
+  name: "New Workflow",
+  nodes: [],
   edges: [],
 };
 
@@ -31,7 +19,7 @@ export default function WorkflowsIndexPage() {
     queryFn: listPlatformWorkflows,
   });
   const createMutation = useMutation({
-    mutationFn: () => createPlatformWorkflow("Workflow Studio", starterSnapshot),
+    mutationFn: () => createPlatformWorkflow("New Workflow", starterSnapshot),
     onSuccess: (workflow) => {
       router.push(`/workflows/${workflow.id}`);
     },

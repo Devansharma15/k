@@ -12,9 +12,14 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .embedding_service import (
+    DEFAULT_LOCAL_EMBEDDING_MODEL,
+    embedding_service,
+)
+
 
 DEFAULT_USER_ID = "demo-user"
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_EMBEDDING_MODEL = DEFAULT_LOCAL_EMBEDDING_MODEL
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 50
 EMBEDDING_BATCH_SIZE = 20
@@ -39,398 +44,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SEED_DATASETS = [
-    {
-        "name": "Education",
-        "description": "Curriculum, assessment, and learning operations.",
-        "documents": [
-            {
-                "title": "Instructional Design Notes",
-                "file_name": "instructional-design-notes.pdf",
-                "content": [
-                    "Instructional design aligns learning outcomes, activities, and assessment methods.",
-                    "Effective curricula scaffold complexity while keeping feedback loops short and useful.",
-                    "Learning experiences benefit from clarity, repetition, and examples tied to authentic tasks.",
-                    "Well-structured materials improve student confidence and reduce avoidable confusion.",
-                ],
-            },
-            {
-                "title": "Assessment Strategy Guide",
-                "file_name": "assessment-strategy-guide.pdf",
-                "content": [
-                    "Assessment strategies should measure knowledge, reasoning, and application rather than recall alone.",
-                    "Rubrics help create transparent expectations and support consistent grading.",
-                    "Frequent low-stakes checks give instructors faster signal about learner progress.",
-                    "Program reviews should connect assessment evidence to curriculum improvement plans.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Research Papers",
-        "description": "Paper reading, synthesis, and scientific communication.",
-        "documents": [
-            {
-                "title": "Reading Scientific Papers",
-                "file_name": "reading-scientific-papers.pdf",
-                "content": [
-                    "Reading scientific papers effectively starts with the abstract, figures, and conclusion.",
-                    "Researchers then inspect methods, assumptions, baselines, and evaluation choices in detail.",
-                    "A strong reading habit captures open questions, reproducibility notes, and related work.",
-                    "Paper libraries are more useful when summaries and tags are maintained consistently.",
-                ],
-            },
-            {
-                "title": "Literature Review Framework",
-                "file_name": "literature-review-framework.pdf",
-                "content": [
-                    "Literature reviews organize prior work by theme, method, gap, and evidence strength.",
-                    "A useful review explains where the field agrees, where uncertainty remains, and why.",
-                    "Researchers should note sampling limitations, datasets, evaluation metrics, and confounders.",
-                    "A good synthesis supports better experimental design and clearer positioning.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Programming",
-        "description": "Software engineering, systems design, and code quality.",
-        "documents": [
-            {
-                "title": "Software Design Patterns",
-                "file_name": "software-design-patterns.pdf",
-                "content": [
-                    "Design patterns provide reusable ways to organize behavior, state, and communication.",
-                    "Patterns should support clarity and maintainability rather than become ceremony.",
-                    "Teams often combine modular boundaries, typed interfaces, and observability primitives.",
-                    "Strong design practice includes careful tradeoffs around coupling, testing, and failure recovery.",
-                ],
-            },
-            {
-                "title": "Code Review Playbook",
-                "file_name": "code-review-playbook.pdf",
-                "content": [
-                    "Code review focuses first on correctness, regression risk, and missing test coverage.",
-                    "Helpful feedback explains impact and suggests paths forward without obscuring ownership.",
-                    "Review quality improves when changes are small, well-described, and easy to exercise.",
-                    "A healthy review culture balances product speed with long-term system health.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Business",
-        "description": "Strategy, operations, decision-making, and execution.",
-        "documents": [
-            {
-                "title": "Business Strategy Overview",
-                "file_name": "business-strategy-overview.pdf",
-                "content": [
-                    "Business strategy aligns market position, differentiation, operations, and resource allocation.",
-                    "Leaders identify where the company can win and what capabilities are required to do so.",
-                    "Execution improves when strategic choices are visible in roadmaps, staffing, and metrics.",
-                    "Teams need feedback loops that connect customer signal to planning decisions.",
-                ],
-            },
-            {
-                "title": "Operating Rhythm Guide",
-                "file_name": "operating-rhythm-guide.pdf",
-                "content": [
-                    "Operating rhythm includes planning cadences, reviews, escalation paths, and decision forums.",
-                    "Clear accountability and shared metrics reduce cross-functional friction.",
-                    "Well-run organizations maintain a small number of meaningful goals and check progress often.",
-                    "A strong rhythm supports speed without losing alignment or execution quality.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Marketing",
-        "description": "Audience insight, campaigns, messaging, and measurement.",
-        "documents": [
-            {
-                "title": "Campaign Planning Guide",
-                "file_name": "campaign-planning-guide.pdf",
-                "content": [
-                    "Campaign planning begins with audience definition, message clarity, and measurable outcomes.",
-                    "Marketers align channels, creative, timing, and budget to a consistent narrative.",
-                    "Campaign reviews compare conversion quality, CAC, retention, and funnel bottlenecks.",
-                    "Strong planning reduces waste and improves iteration speed across channels.",
-                ],
-            },
-            {
-                "title": "Brand Messaging Framework",
-                "file_name": "brand-messaging-framework.pdf",
-                "content": [
-                    "Brand messaging turns customer pain points into a consistent point of view.",
-                    "Effective messaging is concrete, differentiated, and easy to repeat across teams.",
-                    "Positioning should be tested with prospects, internal teams, and performance data.",
-                    "A durable message architecture improves launch quality and sales enablement.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "E-commerce",
-        "description": "Catalog, fulfillment, merchandising, and conversion operations.",
-        "documents": [
-            {
-                "title": "E-commerce Operations Handbook",
-                "file_name": "ecommerce-operations-handbook.pdf",
-                "content": [
-                    "E-commerce operations coordinate catalog quality, pricing, inventory, fulfillment, and support.",
-                    "High-performing stores reduce friction in search, checkout, shipping, and returns.",
-                    "Teams monitor conversion, average order value, repeat purchase rate, and margin.",
-                    "Operational resilience matters during launches, promotions, and seasonal demand spikes.",
-                ],
-            },
-            {
-                "title": "Merchandising and Conversion Notes",
-                "file_name": "merchandising-and-conversion-notes.pdf",
-                "content": [
-                    "Merchandising combines assortment, presentation, and merchandising rules to guide purchase intent.",
-                    "Good product pages answer common objections with clarity, trust, and rich evidence.",
-                    "Experimentation helps teams learn which offers, bundles, and layouts increase conversion.",
-                    "Insights from returns and support can improve the storefront as much as paid acquisition.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Psychology",
-        "description": "Behavior, cognition, and mental processes.",
-        "documents": [
-            {
-                "title": "Cognitive Biases Survey",
-                "file_name": "cognitive-biases-survey.pdf",
-                "content": [
-                    "Cognitive biases influence judgment under uncertainty, stress, and limited attention.",
-                    "Common examples include anchoring, confirmation bias, and availability effects.",
-                    "Decision support systems can reduce bias when they surface alternatives and missing data.",
-                    "Teams benefit from structured reflection when making high-stakes decisions.",
-                ],
-            },
-            {
-                "title": "Motivation and Behavior Notes",
-                "file_name": "motivation-and-behavior-notes.pdf",
-                "content": [
-                    "Motivation research examines intrinsic drivers, rewards, context, and habit formation.",
-                    "Behavior change usually requires small loops of cue, action, and reinforcement.",
-                    "Organizations can improve outcomes by designing systems that support autonomy and mastery.",
-                    "Useful interventions balance clarity, accountability, and realistic pacing.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "History",
-        "description": "Historical method, sources, and long-term change.",
-        "documents": [
-            {
-                "title": "Historical Analysis Primer",
-                "file_name": "historical-analysis-primer.pdf",
-                "content": [
-                    "Historical analysis compares sources, context, chronology, and competing interpretations.",
-                    "Primary evidence should be read with attention to authorship, audience, and purpose.",
-                    "Historians examine continuity and change across institutions, technology, and culture.",
-                    "Good historical writing connects evidence to argument without overstating certainty.",
-                ],
-            },
-            {
-                "title": "Archives and Sources Guide",
-                "file_name": "archives-and-sources-guide.pdf",
-                "content": [
-                    "Archives preserve letters, reports, photographs, and records that support historical inquiry.",
-                    "Researchers document provenance carefully to avoid citation errors and weak claims.",
-                    "Source triangulation helps assess bias, reliability, and missing viewpoints.",
-                    "A disciplined notes system makes synthesis and writing much easier later on.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Environment",
-        "description": "Climate, ecosystems, policy, and sustainability.",
-        "documents": [
-            {
-                "title": "Climate Systems Overview",
-                "file_name": "climate-systems-overview.pdf",
-                "content": [
-                    "Climate systems involve atmospheric circulation, oceans, biospheres, and human activity.",
-                    "Environmental analysis often connects emissions, land use, resilience, and adaptation planning.",
-                    "Effective sustainability programs rely on measurable targets and transparent reporting.",
-                    "Decision-makers need both local context and long-range scenarios to plan responsibly.",
-                ],
-            },
-            {
-                "title": "Sustainability Reporting Notes",
-                "file_name": "sustainability-reporting-notes.pdf",
-                "content": [
-                    "Sustainability reports track emissions, water, waste, energy, and supply chain practices.",
-                    "Data quality is critical because environmental claims require evidence and consistency.",
-                    "Many organizations align reports to shared frameworks for comparability and governance.",
-                    "Cross-functional ownership improves both reporting quality and operational follow-through.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Cybersecurity",
-        "description": "Threat detection, controls, response, and resilience.",
-        "documents": [
-            {
-                "title": "Security Operations Brief",
-                "file_name": "security-operations-brief.pdf",
-                "content": [
-                    "Security operations monitor identity, endpoints, logs, and alerts for suspicious activity.",
-                    "Incident response depends on preparation, triage quality, and communication discipline.",
-                    "Detection engineering improves when controls are reviewed against realistic attacker paths.",
-                    "A strong security posture combines technical controls with practiced operational response.",
-                ],
-            },
-            {
-                "title": "Application Security Checklist",
-                "file_name": "application-security-checklist.pdf",
-                "content": [
-                    "Application security includes secure defaults, dependency review, secrets handling, and testing.",
-                    "Teams should prioritize auth flows, data access, input handling, and observability.",
-                    "Threat modeling helps identify likely abuse cases before they reach production.",
-                    "Security reviews are most effective when they are early, repeatable, and actionable.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "AI & Machine Learning",
-        "description": "Foundational concepts and practical applications across AI systems.",
-        "documents": [
-            {
-                "title": "Neural Networks Overview",
-                "file_name": "neural-networks-overview.pdf",
-                "content": [
-                    "Neural networks are layered function approximators designed to map inputs to outputs.",
-                    "Training usually involves gradient descent, backpropagation, and careful regularization.",
-                    "Modern machine learning systems rely on embeddings, transformers, retrieval, and evaluation.",
-                    "Production AI systems must also consider latency, observability, and safe failure modes.",
-                ],
-            },
-            {
-                "title": "Retrieval Augmented Generation Basics",
-                "file_name": "retrieval-augmented-generation-basics.pdf",
-                "content": [
-                    "Retrieval augmented generation combines document search with generative models.",
-                    "A typical pipeline extracts text, chunks documents, embeds chunks, and stores vectors.",
-                    "At query time the system embeds the question, retrieves relevant chunks, and synthesizes an answer.",
-                    "Good RAG quality depends on document hygiene, chunk design, metadata, and evaluation.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Data Science",
-        "description": "Statistics, experimentation, pipelines, and analytical workflows.",
-        "documents": [
-            {
-                "title": "Data Cleaning Handbook",
-                "file_name": "data-cleaning-handbook.pdf",
-                "content": [
-                    "Data cleaning includes schema checks, null handling, deduplication, and distribution review.",
-                    "Feature quality often matters more than model complexity in business analytics projects.",
-                    "A clean analytical pipeline documents assumptions, transformations, and validation rules.",
-                    "Teams should monitor data freshness and guard against silent upstream drift.",
-                ],
-            },
-            {
-                "title": "Experiment Design Primer",
-                "file_name": "experiment-design-primer.pdf",
-                "content": [
-                    "Experiment design starts with a hypothesis, an outcome metric, and a clear sampling plan.",
-                    "Randomization reduces bias while power analysis helps avoid under-sized tests.",
-                    "Analysts should report effect sizes, confidence intervals, and practical implications.",
-                    "A reliable experimentation practice also tracks guardrail metrics and logging quality.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Healthcare",
-        "description": "Clinical workflows, patient safety, and healthcare operations.",
-        "documents": [
-            {
-                "title": "Clinical Documentation Guide",
-                "file_name": "clinical-documentation-guide.pdf",
-                "content": [
-                    "Clinical documentation must be timely, legible, attributable, and useful at the point of care.",
-                    "Structured notes improve downstream coding, care coordination, and patient follow-up.",
-                    "Healthcare systems rely on careful access control, auditability, and decision support.",
-                    "Documentation quality directly affects patient safety and continuity of care.",
-                ],
-            },
-            {
-                "title": "Hospital Operations Summary",
-                "file_name": "hospital-operations-summary.pdf",
-                "content": [
-                    "Hospital operations coordinate staffing, triage, scheduling, supply flow, and discharge planning.",
-                    "Bottlenecks often appear in emergency departments, imaging, and bed assignment workflows.",
-                    "Operational dashboards help teams monitor throughput, occupancy, and incident response.",
-                    "Reliable escalation policies reduce delays in treatment and improve patient experience.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Finance",
-        "description": "Financial controls, reporting, risk, and market structure.",
-        "documents": [
-            {
-                "title": "Corporate Finance Fundamentals",
-                "file_name": "corporate-finance-fundamentals.pdf",
-                "content": [
-                    "Corporate finance evaluates capital allocation, financing choices, and long-term value creation.",
-                    "Core topics include cash flow, discount rates, working capital, and profitability.",
-                    "Financial reporting depends on reliable controls, consistent periods, and reconciled ledgers.",
-                    "Leaders balance growth opportunities against liquidity, debt, and operational risk.",
-                ],
-            },
-            {
-                "title": "Risk Controls Overview",
-                "file_name": "risk-controls-overview.pdf",
-                "content": [
-                    "Risk controls include segregation of duties, transaction monitoring, and exception review.",
-                    "Audit trails and reconciliations help organizations detect fraud and reporting issues early.",
-                    "Treasury workflows often monitor cash positions, exposure, and funding obligations daily.",
-                    "Operational resilience matters as much as forecasting accuracy in financial systems.",
-                ],
-            },
-        ],
-    },
-    {
-        "name": "Legal",
-        "description": "Contracts, compliance, legal process, and document review.",
-        "documents": [
-            {
-                "title": "Contract Review Checklist",
-                "file_name": "contract-review-checklist.pdf",
-                "content": [
-                    "Contract review checks definitions, obligations, payment terms, liability, and termination clauses.",
-                    "Teams should confirm governing law, confidentiality language, and assignment provisions.",
-                    "Clear issue spotting prevents downstream disputes and reduces negotiation cycles.",
-                    "Version control and approval records are important for enterprise legal operations.",
-                ],
-            },
-            {
-                "title": "Compliance Monitoring Notes",
-                "file_name": "compliance-monitoring-notes.pdf",
-                "content": [
-                    "Compliance teams maintain policies, evidence registers, incident logs, and control testing records.",
-                    "Monitoring programs benefit from recurring review cadences and clearly named owners.",
-                    "When obligations change, organizations need fast impact assessment across systems and vendors.",
-                    "A well-run compliance function reduces operational risk and strengthens audit readiness.",
-                ],
-            },
-        ],
-    },
-]
+SEED_DATASETS: list[dict[str, Any]] = []
 
 
 @dataclass
@@ -452,7 +66,10 @@ class KnowledgeBaseService:
         self._storage_root = self._data_root / "knowledge_base"
         self._seed_root = self._data_root / "knowledge_base_seed"
         self._db_path = self._data_root / "knowledge_base.sqlite3"
-        self._collection = os.getenv("QDRANT_COLLECTION", "auraflow_knowledge_base")
+        self._collection = os.getenv(
+            "QDRANT_COLLECTION",
+            "auraflow_knowledge_base_local_v1",
+        )
         self._storage_root.mkdir(parents=True, exist_ok=True)
         self._seed_root.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
@@ -529,32 +146,30 @@ class KnowledgeBaseService:
     def _ensure_dataset_rows(self) -> None:
         now = _utc_now()
         with self._connect() as connection:
-            for dataset in SEED_DATASETS:
-                slug = _slugify(dataset["name"])
-                connection.execute(
-                    """
-                    INSERT INTO datasets (
-                        id, user_id, name, slug, description, embedding_model, chunk_size, created_at, updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(slug) DO UPDATE SET
-                        description = excluded.description,
-                        embedding_model = excluded.embedding_model,
-                        chunk_size = excluded.chunk_size,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        f"dataset_{slug}",
-                        DEFAULT_USER_ID,
-                        dataset["name"],
-                        slug,
-                        dataset["description"],
-                        DEFAULT_EMBEDDING_MODEL,
-                        DEFAULT_CHUNK_SIZE,
-                        now,
-                        now,
-                    ),
+            connection.execute(
+                """
+                INSERT INTO datasets (
+                    id, user_id, name, slug, description, embedding_model, chunk_size, created_at, updated_at
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    description = excluded.description,
+                    embedding_model = excluded.embedding_model,
+                    chunk_size = excluded.chunk_size,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    "dataset_default",
+                    DEFAULT_USER_ID,
+                    "Default Workspace",
+                    "default",
+                    "Your primary document knowledge base.",
+                    DEFAULT_EMBEDDING_MODEL,
+                    DEFAULT_CHUNK_SIZE,
+                    now,
+                    now,
+                ),
+            )
 
     def _ensure_seed_files(self) -> None:
         for dataset in SEED_DATASETS:
@@ -749,7 +364,9 @@ class KnowledgeBaseService:
             page_count = len(parsed_pages)
             chunks = self._build_chunks(document["dataset_id"], document_id, parsed_pages)
             embeddings = self._embed_chunks([chunk["text"] for chunk in chunks])
-            self._ensure_qdrant_collection(len(embeddings[0]) if embeddings else 1536)
+            self._ensure_qdrant_collection(
+                len(embeddings[0]) if embeddings else embedding_service.vector_size()
+            )
             for chunk, vector in zip(chunks, embeddings):
                 chunk["embedding"] = vector
 
@@ -957,34 +574,10 @@ class KnowledgeBaseService:
         return chunks
 
     def _embed_chunks(self, texts: list[str]) -> list[list[float]]:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise KnowledgeBaseConfigError("OPENAI_API_KEY is not configured.")
-
-        model = os.getenv("OPENAI_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
-        embeddings: list[list[float]] = []
-        for index in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-            batch = texts[index : index + EMBEDDING_BATCH_SIZE]
-            payload = json.dumps({"model": model, "input": batch}).encode("utf-8")
-            request = urllib.request.Request(
-                "https://api.openai.com/v1/embeddings",
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    body = json.loads(response.read().decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="ignore")
-                raise KnowledgeBaseConfigError(
-                    f"OpenAI embedding request failed: {detail or exc.reason}"
-                ) from exc
-            embeddings.extend(item["embedding"] for item in body["data"])
-        return embeddings
+        try:
+            return embedding_service.embed_texts(texts)
+        except RuntimeError as exc:
+            raise KnowledgeBaseConfigError(str(exc)) from exc
 
     def _qdrant_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -1036,6 +629,27 @@ class KnowledgeBaseService:
                 f"/collections/{self._collection}",
                 {"vectors": {"size": vector_size, "distance": "Cosine"}},
             )
+            return
+
+        existing_size = self._collection_vector_size(existing)
+        if existing_size is not None and existing_size != vector_size:
+            raise KnowledgeBaseConfigError(
+                f"Qdrant collection '{self._collection}' uses vector size {existing_size}, expected {vector_size}. "
+                "Use a new collection name for the local embedding pipeline."
+            )
+
+    def _collection_vector_size(self, response: dict[str, Any]) -> int | None:
+        vectors = (
+            response.get("result", {})
+            .get("config", {})
+            .get("params", {})
+            .get("vectors")
+        )
+        if isinstance(vectors, dict):
+            size = vectors.get("size")
+            if isinstance(size, int):
+                return size
+        return None
 
     def _upsert_qdrant_points(
         self,
@@ -1239,43 +853,32 @@ class KnowledgeBaseService:
         dataset_name: str,
         lines: list[str],
     ) -> None:
-        def escape(value: str) -> str:
-            return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        try:
+            from fpdf import FPDF
+        except ImportError as exc:
+            raise KnowledgeBaseConfigError("fpdf2 is required for seeding real PDFs. Please run `pip install fpdf2`") from exc
 
-        content_lines = [
-            "BT",
-            "/F1 20 Tf",
-            "50 760 Td",
-            f"({escape(title)}) Tj",
-            "0 -26 Td",
-            "/F1 12 Tf",
-            f"({escape(dataset_name)}) Tj",
-        ]
+        pdf = FPDF()
+        pdf.add_page()
+        
+        # Add a professional header
+        pdf.set_font("helvetica", "B", 20)
+        pdf.set_text_color(40, 40, 40)
+        pdf.cell(0, 15, title, new_x="LMARGIN", new_y="NEXT", align="C")
+        
+        pdf.set_font("helvetica", "I", 14)
+        pdf.set_text_color(100, 100, 100)
+        pdf.cell(0, 10, f"Domain: {dataset_name}", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.ln(10)
+        
+        # Add contents
+        pdf.set_font("helvetica", "", 12)
+        pdf.set_text_color(20, 20, 20)
         for line in lines:
-            content_lines.extend(["0 -20 Td", f"({escape(line)}) Tj"])
-        content_lines.append("ET")
-        stream = "\n".join(content_lines)
-        objects = [
-            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
-            "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
-            f"5 0 obj\n<< /Length {len(stream.encode('utf-8'))} >>\nstream\n{stream}\nendstream\nendobj\n",
-        ]
-        output = "%PDF-1.4\n"
-        offsets = [0]
-        for obj in objects:
-            offsets.append(len(output.encode("utf-8")))
-            output += obj
-        xref_offset = len(output.encode("utf-8"))
-        output += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n"
-        for offset in offsets[1:]:
-            output += f"{offset:010d} 00000 n \n"
-        output += (
-            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
-            f"startxref\n{xref_offset}\n%%EOF"
-        )
-        target.write_bytes(output.encode("utf-8"))
+            pdf.multi_cell(0, 8, line)
+            pdf.ln(5)
+            
+        pdf.output(str(target))
 
 
 knowledge_base_service = KnowledgeBaseService()

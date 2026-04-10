@@ -162,13 +162,7 @@ export default function KnowledgeBasePage() {
             </p>
           </div>
           <div className="flex flex-wrap gap-3">
-            <button
-              onClick={() => seedMutation.mutate()}
-              disabled={seedMutation.isPending}
-              className="rounded-full border border-border bg-card px-5 py-3 text-sm font-semibold transition-colors hover:bg-accent disabled:opacity-60"
-            >
-              {seedMutation.isPending ? "Seeding..." : "Seed Sample PDFs"}
-            </button>
+
             <button
               onClick={() => fileInputRef.current?.click()}
               disabled={!selectedDatasetId || uploadMutation.isPending}
@@ -193,11 +187,7 @@ export default function KnowledgeBasePage() {
           </div>
         </div>
 
-        <div className="mt-8 grid gap-4 md:grid-cols-3">
-          <SummaryCard
-            label="Datasets"
-            value={datasetsQuery.data?.summary.total_datasets ?? 15}
-          />
+        <div className="mt-8 grid gap-4 md:grid-cols-2">
           <SummaryCard
             label="Documents"
             value={datasetsQuery.data?.summary.total_documents ?? 0}
@@ -209,51 +199,14 @@ export default function KnowledgeBasePage() {
         </div>
       </section>
 
-      <section className="grid gap-6 xl:grid-cols-[280px_1fr_1.1fr]">
-        <aside className="rounded-[2rem] border border-border bg-card/70 p-5">
-          <div className="flex items-center gap-3">
-            <BookOpen className="h-5 w-5 text-sky-400" />
-            <div>
-              <h2 className="text-lg font-semibold">Datasets</h2>
-              <p className="text-sm text-muted-foreground">
-                15 preloaded knowledge domains
-              </p>
-            </div>
-          </div>
-          <div className="mt-5 space-y-2">
-            {datasetsQuery.data?.datasets.map((dataset) => (
-              <button
-                key={dataset.id}
-                onClick={() => setSelectedDatasetId(dataset.id)}
-                className={cn(
-                  "w-full rounded-[1.25rem] border p-4 text-left transition-all",
-                  selectedDatasetId === dataset.id
-                    ? "border-primary/40 bg-primary/10"
-                    : "border-border bg-background/80 hover:border-border/80 hover:bg-accent/40",
-                )}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <p className="font-semibold">{dataset.name}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {dataset.document_count} docs, {dataset.chunk_count} chunks
-                    </p>
-                  </div>
-                  <span className="rounded-full bg-secondary px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                    {dataset.ready_count} ready
-                  </span>
-                </div>
-              </button>
-            ))}
-          </div>
-        </aside>
+      <section className="grid gap-6 xl:grid-cols-[1fr_1.1fr]">
 
         <div className="space-y-6">
           <section className="rounded-[2rem] border border-border bg-card/70 p-5">
             <div className="flex items-center justify-between gap-4">
               <div>
                 <h2 className="text-xl font-semibold">
-                  {documentsQuery.data?.dataset.name ?? "Dataset documents"}
+                  Knowledge Base Documents
                 </h2>
                 <p className="mt-1 text-sm text-muted-foreground">
                   Upload PDFs, monitor ingestion, and manage the selected corpus.

@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+python-multipart
+redis
+rq
+openai
+cryptography
+pypdf
+fpdf2
+sentence-transformers

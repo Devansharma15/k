@@ -175,3 +175,118 @@ async def generate_workflow(request: GenerateWorkflowRequest):
         return workflow_architect_service.generate(request.prompt)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ── Template CRUD ─────────────────────────────────────────────────
+
+class TemplateSaveRequest(BaseModel):
+    name: str
+    category: str = "Custom"
+    difficulty: str = "medium"
+    description: str = ""
+    integrations_required: list[str] = []
+    snapshot: dict[str, Any] = {}
+    change_summary: str = ""
+
+
+@router.post("/templates")
+async def create_template(request: TemplateSaveRequest):
+    try:
+        return workflow_platform_service.create_template(
+            name=request.name, category=request.category,
+            difficulty=request.difficulty, description=request.description,
+            integrations_required=request.integrations_required,
+            snapshot=request.snapshot,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/templates/{template_id}")
+async def get_template(template_id: str):
+    try:
+        return workflow_platform_service.get_template(template_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/templates/{template_id}")
+async def update_template(template_id: str, request: TemplateSaveRequest):
+    try:
+        return workflow_platform_service.update_template(
+            template_id, request.name, request.snapshot, change_summary=request.change_summary,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/templates/{template_id}")
+async def delete_template(template_id: str):
+    try:
+        return workflow_platform_service.delete_template(template_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/templates/{template_id}/versions")
+async def list_template_versions(template_id: str):
+    return workflow_platform_service.list_template_versions(template_id)
+
+
+@router.post("/templates/{template_id}/rollback/{version_id}")
+async def rollback_template(template_id: str, version_id: str):
+    try:
+        return workflow_platform_service.rollback_template(template_id, version_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/templates/{template_id}/compare/{v1_id}/{v2_id}")
+async def compare_template_versions(template_id: str, v1_id: str, v2_id: str):
+    try:
+        return workflow_platform_service.compare_template_versions(template_id, v1_id, v2_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ── Workflow Limits ───────────────────────────────────────────────
+
+class WorkflowLimitsRequest(BaseModel):
+    max_nodes: int = 100
+    max_depth: int = 50
+    max_execution_time_ms: int = 300000
+    max_retries_total: int = 20
+    max_sub_workflow_depth: int = 5
+
+
+@router.get("/workflow-limits")
+async def get_workflow_limits():
+    return workflow_platform_service.get_workflow_limits()
+
+
+@router.post("/workflow-limits")
+async def update_workflow_limits(request: WorkflowLimitsRequest):
+    return workflow_platform_service.update_workflow_limits(request.model_dump())
+
+
+# ── Autosave ──────────────────────────────────────────────────────
+
+class AutosaveRequest(BaseModel):
+    entity_type: str
+    entity_id: str
+    snapshot: dict[str, Any]
+
+
+@router.post("/autosave")
+async def autosave_draft(request: AutosaveRequest):
+    return workflow_platform_service.autosave_draft(
+        request.entity_type, request.entity_id, request.snapshot,
+    )
+
+
+@router.get("/autosave/{entity_type}/{entity_id}")
+async def get_autosave_draft(entity_type: str, entity_id: str):
+    result = workflow_platform_service.get_autosave_draft(entity_type, entity_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="No autosave draft found.")
+    return result

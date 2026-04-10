@@ -1335,6 +1335,7 @@ class WorkflowPlatformService:
             logs.append(
                 {
                     "node_id": step["node_id"],
+                    "node_type": step["node_type"],
                     "status": step["status"],
                     "message": step["error_message"] or f"Node {step['status']}",
                     "timestamp": step["started_at"],
@@ -1478,36 +1479,26 @@ class WorkflowPlatformService:
                 ),
             )
 
+        # Enqueue the workflow execution to the Upstash Redis queue asynchronously
         try:
-            final_output = self._execute_snapshot(run_id, workflow_id, snapshot, context, mode, debug)
+            from app.services.queue_service import enqueue_workflow
+            enqueue_workflow(
+                run_id,
+                workflow_id,
+                snapshot,
+                context,
+                mode,
+                debug
+            )
+        except Exception as queue_exc:
             with self._connect() as connection:
                 connection.execute(
                     """
                     UPDATE workflow_runs
-                    SET status = ?, final_output = ?, context_snapshot = ?, updated_at = ?
+                    SET status = ?, error_message = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    ("completed", json.dumps(final_output), json.dumps(context), _utc_now(), run_id),
-                )
-        except PauseIteration as paused:
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    UPDATE workflow_runs
-                    SET status = ?, context_snapshot = ?, final_output = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    ("waiting_approval", json.dumps(context), json.dumps(paused.payload), _utc_now(), run_id),
-                )
-        except Exception as exc:
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    UPDATE workflow_runs
-                    SET status = ?, error_message = ?, context_snapshot = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    ("failed", str(exc), json.dumps(context), _utc_now(), run_id),
+                    ("failed", f"Failed to enqueue background job to Upstash: {queue_exc}", _utc_now(), run_id),
                 )
 
         return self.get_run(workflow_id, run_id)
@@ -1735,6 +1726,12 @@ class WorkflowPlatformService:
             step_id = f"step_{uuid4().hex}"
             started_at = _utc_now()
             decision_snapshot = None
+            
+            self._write_step(
+                step_id, run_id, node, "running", attempt, node_input, None, None, None, started_at
+            )
+            print(f"[Executor] Running node {node['id']} ({node['type']})")
+
             try:
                 if node.get("ai_brain"):
                     decision_snapshot = self._run_ai_brain(node, node_input, context)
@@ -2014,6 +2011,12 @@ class WorkflowPlatformService:
                     decision_snapshot, error_message, started_at, finished_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status=excluded.status,
+                    output_snapshot=excluded.output_snapshot,
+                    decision_snapshot=excluded.decision_snapshot,
+                    error_message=excluded.error_message,
+                    finished_at=excluded.finished_at
                 """,
                 (
                     step_id,
@@ -2027,9 +2030,10 @@ class WorkflowPlatformService:
                     json.dumps(decision_snapshot) if decision_snapshot is not None else None,
                     error_message,
                     started_at,
-                    _utc_now(),
+                    _utc_now() if status != "running" else None,
                 ),
             )
+            print(f"[Logs] Saved log: {run_id} | node {node['id']} | status: {status}")
 
     def _deserialize_run(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)

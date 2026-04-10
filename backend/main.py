@@ -1,8 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
+from dotenv import load_dotenv
 
-from app.api import apps, chat, files, integrations, knowledge_base, overview, workflow, workflow_platform
+load_dotenv()
+
+from app.api import apps, chat, integrations, knowledge_base, overview, workflow, workflow_platform
 
 print("Starting AuraFlow Backend...")
 app = FastAPI(title="AuraFlow Backend")
@@ -30,7 +33,6 @@ app.include_router(chat.router, prefix="/api", tags=["Chat"])
 app.include_router(workflow.router, prefix="/api", tags=["Workflow"])
 app.include_router(workflow_platform.router, prefix="/api", tags=["Workflow Platform"])
 app.include_router(apps.router, prefix="/api", tags=["Apps"])
-app.include_router(files.router, prefix="/api", tags=["Files"])
 
 @app.get("/")
 async def root():

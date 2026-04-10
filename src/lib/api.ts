@@ -299,6 +299,7 @@ export interface WorkflowNodeType {
 
 export interface WorkflowRunLog {
   node_id: string;
+  node_type: string;
   status: string;
   message: string;
   timestamp: string;
