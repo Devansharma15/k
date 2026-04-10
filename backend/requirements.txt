@@ -5,7 +5,6 @@ python-dotenv
 python-multipart
 redis
 rq
-openai
 cryptography
 pypdf
 fpdf2

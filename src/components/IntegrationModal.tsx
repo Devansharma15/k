@@ -112,7 +112,7 @@ export function IntegrationModal({
         const nango = new Nango({
           connectSessionToken: result.connect_session_token,
         });
-        nango.open();
+        await nango.auth(result.nango_integration_id);
         await pollIntegrationStatus(result.provider);
       } catch (error) {
         setMessage(

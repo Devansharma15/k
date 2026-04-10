@@ -96,6 +96,7 @@ export type ApiKeyConnectResponse = IntegrationConnection;
 export interface OAuthSessionResponse extends IntegrationConnection {
   status: string;
   connect_session_token: string;
+  nango_integration_id: string;
 }
 
 export interface KnowledgeBaseDataset {

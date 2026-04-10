@@ -15,7 +15,10 @@ from uuid import uuid4
 from .embedding_service import (
     DEFAULT_LOCAL_EMBEDDING_MODEL,
     embedding_service,
+    cross_encoder_service,
 )
+from .local_faiss_store import FaissSimpleStore
+import re
 
 
 DEFAULT_USER_ID = "demo-user"
@@ -70,6 +73,13 @@ class KnowledgeBaseService:
             "QDRANT_COLLECTION",
             "auraflow_knowledge_base_local_v1",
         )
+
+        # Decide vector backend: Qdrant (remote) or local numpy store
+        self._use_qdrant = False # Force completely local
+        self._local_store = FaissSimpleStore(
+            self._data_root / "faiss_store.json"
+        )
+
         self._storage_root.mkdir(parents=True, exist_ok=True)
         self._seed_root.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
@@ -456,6 +466,15 @@ class KnowledgeBaseService:
         document = self._get_document(dataset_id, document_id, user_id)
         return Path(document["path"])
 
+    def _heuristic_expand_query(self, query: str) -> list[str]:
+        clean = query.lower().strip()
+        return [
+            clean,
+            f"definition of {clean}",
+            f"explain {clean} in detail",
+            f"meaning and context of {clean}"
+        ]
+
     def query_dataset(
         self,
         dataset_id: str,
@@ -474,8 +493,90 @@ class KnowledgeBaseService:
                 "results": cached,
             }
 
-        embedding = self._embed_chunks([query])[0]
-        results = self._search_qdrant(dataset_id, embedding, top_k)
+        # 1. Multi Query Expansion
+        expanded_queries = self._heuristic_expand_query(query)
+        embeddings = self._embed_chunks(expanded_queries)
+        
+        # 2. FAISS Dense Retrieval
+        dense_results = []
+        seen_ids = set()
+        for emb in embeddings:
+            res = self._local_store.search(emb, top_k=20, filter_key="dataset_id", filter_val=dataset_id)
+            for r in res:
+                if r["id"] not in seen_ids:
+                    seen_ids.add(r["id"])
+                    dense_results.append(r)
+        
+        # 3. BM25 Keyword Retrieval
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            raise KnowledgeBaseConfigError("rank_bm25 must be installed.")
+            
+        with self._connect() as connection:
+            all_chunks = connection.execute("SELECT * FROM chunks WHERE dataset_id = ?", (dataset_id,)).fetchall()
+        
+        chunk_dicts = [dict(r) for r in all_chunks]
+        tokenized_corpus = [c["text"].lower().split() for c in chunk_dicts]
+        
+        if tokenized_corpus:
+            bm25 = BM25Okapi(tokenized_corpus)
+            tokenized_query = normalized_query.split()
+            bm25_scores = bm25.get_scores(tokenized_query)
+            bm25_results = []
+            for score, c in zip(bm25_scores, chunk_dicts):
+                if score > 0:
+                    bm25_results.append({"id": c["vector_id"], "score": score, "payload": c})
+            bm25_results.sort(key=lambda x: x["score"], reverse=True)
+            bm25_results = bm25_results[:50]
+        else:
+            bm25_results = []
+
+        # 4. Hybrid Scoring (RRF)
+        fused_scores = {}
+        for rank, doc in enumerate(sorted(dense_results, key=lambda x: x["score"], reverse=True)):
+            fused_scores[doc["id"]] = fused_scores.get(doc["id"], 0.0) + (1.0 / (60 + rank))
+        for rank, doc in enumerate(bm25_results):
+            fused_scores[doc["id"]] = fused_scores.get(doc["id"], 0.0) + (1.0 / (60 + rank))
+            
+        id_to_payload = {r["id"]: r["payload"] for r in dense_results + bm25_results}
+        fused_docs = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)[:20]
+        
+        top_candidates = [id_to_payload[d_id] for d_id, score in fused_docs]
+        
+        if not top_candidates:
+            return {"dataset_id": dataset_id, "query": query, "cached": False, "results": []}
+            
+        # 5. Cross Encoder Reranking & Thresholding
+        pairs = [[query, p["text"]] for p in top_candidates]
+        cross_scores = cross_encoder_service.predict(pairs)
+        
+        for cand, ce_score in zip(top_candidates, cross_scores):
+            cand["rerank_score"] = ce_score
+            
+        top_candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+        best_score = top_candidates[0]["rerank_score"]
+        
+        threshold = best_score * 0.65 if best_score > 0 else best_score - 2.0
+        final_docs = [c for c in top_candidates if c["rerank_score"] >= threshold][:top_k]
+        
+        payloads_for_titles = [{"payload": d} for d in final_docs]
+        titles = self._document_titles_for_results(payloads_for_titles)
+        
+        results = [
+            {
+                "chunk_id": item.get("chunk_id", item.get("id")),
+                "document_id": item["document_id"],
+                "document_title": titles.get(item["document_id"], "Document"),
+                "page_number": item.get("page", item.get("page_number", 1)),
+                "start_char": item["start_char"],
+                "end_char": item["end_char"],
+                "text": item["text"],
+                "score": float(item["rerank_score"]),
+            }
+            for item in final_docs
+        ]
+        
         self._store_query_cache(dataset_id, normalized_query, results)
         return {
             "dataset_id": dataset_id,
@@ -528,6 +629,13 @@ class KnowledgeBaseService:
                 (document_id,),
             ).fetchone()["total"]
 
+    def _clean_text(self, text: str) -> str:
+        # Remove consecutive line breaks and merge hyphenated words at line breaks
+        text = re.sub(r"-\n+", "", text)
+        text = re.sub(r"\n+", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
     def _extract_pdf_pages(self, file_path: Path) -> list[str]:
         try:
             from pypdf import PdfReader
@@ -535,7 +643,7 @@ class KnowledgeBaseService:
             raise KnowledgeBaseConfigError("pypdf is required for PDF ingestion.") from exc
 
         reader = PdfReader(str(file_path))
-        return [(page.extract_text() or "").strip() for page in reader.pages]
+        return [self._clean_text(page.extract_text() or "") for page in reader.pages]
 
     def _build_chunks(
         self,
@@ -544,32 +652,47 @@ class KnowledgeBaseService:
         pages: list[str],
     ) -> list[dict[str, Any]]:
         chunks: list[dict[str, Any]] = []
-        step = DEFAULT_CHUNK_SIZE - DEFAULT_CHUNK_OVERLAP
+        
         for page_index, page_text in enumerate(pages, start=1):
             if not page_text:
                 continue
-            starts = [0] if len(page_text) <= DEFAULT_CHUNK_SIZE else list(range(0, len(page_text), step))
-            for chunk_index, start in enumerate(starts):
-                end = min(start + DEFAULT_CHUNK_SIZE, len(page_text))
-                text = page_text[start:end].strip()
-                if not text:
-                    continue
-                chunk_id = f"chunk_{uuid4().hex}"
-                chunks.append(
-                    {
-                        "id": chunk_id,
-                        "dataset_id": dataset_id,
-                        "document_id": document_id,
-                        "chunk_index": chunk_index,
-                        "page_number": page_index,
-                        "start_char": start,
-                        "end_char": end,
-                        "text": text,
-                        "vector_id": chunk_id,
-                    }
-                )
-                if end >= len(page_text):
-                    break
+            
+            # Split by sentences robustly
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', page_text) if s.strip()]
+            
+            target_sentences = 7 # aim for 5-10
+            overlap = 2
+            
+            chunk_index = 0
+            start_idx = 0
+            
+            while start_idx < len(sentences):
+                end_idx = min(start_idx + target_sentences, len(sentences))
+                chunk_sentences = sentences[start_idx:end_idx]
+                text = " ".join(chunk_sentences)
+                
+                if text:
+                    chunk_id = f"chunk_{uuid4().hex}"
+                    
+                    # Store as parent chunk (in this simplified 1:1 format, the chunk itself acts as the granular semantic block,
+                    # but retains enough context logically. If we needed a huge parent, we could group by page).
+                    # Since our sentences range 5-10, they already provide a strong parent context.
+                    # BM25 and FAISS will hit this precise block.
+                    chunks.append(
+                        {
+                            "id": chunk_id,
+                            "dataset_id": dataset_id,
+                            "document_id": document_id,
+                            "chunk_index": chunk_index,
+                            "page_number": page_index,
+                            "start_char": 0, # Char indexes are less relevant now, kept 0 for DB constraints
+                            "end_char": len(text),
+                            "text": text,
+                            "vector_id": chunk_id,
+                        }
+                    )
+                chunk_index += 1
+                start_idx += (target_sentences - overlap)
 
         return chunks
 
@@ -618,6 +741,10 @@ class KnowledgeBaseService:
             ) from exc
 
     def _ensure_qdrant_collection(self, vector_size: int) -> None:
+        if not self._use_qdrant:
+            # FaissSimpleStore doesn't need explicit collection creation in this setup
+            return
+
         existing = self._qdrant_request(
             "GET",
             f"/collections/{self._collection}",
@@ -657,28 +784,37 @@ class KnowledgeBaseService:
         document_id: str,
         chunks: list[dict[str, Any]],
     ) -> None:
+        points = [
+            {
+                "id": chunk["vector_id"],
+                "vector": chunk["embedding"],
+                "payload": {
+                    "dataset_id": dataset_id,
+                    "document_id": document_id,
+                    "chunk_id": chunk["id"],
+                    "text": chunk["text"],
+                    "page": chunk["page_number"],
+                    "chunk_index": chunk["chunk_index"],
+                    "start_char": chunk["start_char"],
+                    "end_char": chunk["end_char"],
+                },
+            }
+            for chunk in chunks
+        ]
+
+        if not self._use_qdrant:
+            from .local_faiss_store import FaissSimpleStore
+            if isinstance(self._local_store, FaissSimpleStore):
+                ids = [p["id"] for p in points]
+                vecs = [p["vector"] for p in points]
+                payloads = [p["payload"] for p in points]
+                self._local_store.upsert_batch(ids, vecs, payloads)
+            return
+
         self._qdrant_request(
             "PUT",
             f"/collections/{self._collection}/points?wait=true",
-            {
-                "points": [
-                    {
-                        "id": chunk["vector_id"],
-                        "vector": chunk["embedding"],
-                        "payload": {
-                            "dataset_id": dataset_id,
-                            "document_id": document_id,
-                            "chunk_id": chunk["id"],
-                            "text": chunk["text"],
-                            "page": chunk["page_number"],
-                            "chunk_index": chunk["chunk_index"],
-                            "start_char": chunk["start_char"],
-                            "end_char": chunk["end_char"],
-                        },
-                    }
-                    for chunk in chunks
-                ]
-            },
+            {"points": points},
         )
 
     def _replace_document_chunks(
@@ -714,6 +850,12 @@ class KnowledgeBaseService:
             )
 
     def _delete_qdrant_document(self, document_id: str) -> None:
+        if not self._use_qdrant:
+            from .local_faiss_store import FaissSimpleStore
+            if isinstance(self._local_store, FaissSimpleStore):
+                self._local_store.delete_by_payload_match("document_id", document_id)
+            return
+
         try:
             self._qdrant_request(
                 "POST",
@@ -797,38 +939,8 @@ class KnowledgeBaseService:
         vector: list[float],
         top_k: int,
     ) -> list[dict[str, Any]]:
-        result = self._qdrant_request(
-            "POST",
-            f"/collections/{self._collection}/points/search",
-            {
-                "vector": vector,
-                "limit": top_k,
-                "with_payload": True,
-                "filter": {
-                    "must": [
-                        {
-                            "key": "dataset_id",
-                            "match": {"value": dataset_id},
-                        }
-                    ]
-                },
-            },
-        )
-        payloads = result.get("result", [])
-        titles = self._document_titles_for_results(payloads)
-        return [
-            {
-                "chunk_id": item["payload"]["chunk_id"],
-                "document_id": item["payload"]["document_id"],
-                "document_title": titles.get(item["payload"]["document_id"], "Document"),
-                "page_number": item["payload"]["page"],
-                "start_char": item["payload"]["start_char"],
-                "end_char": item["payload"]["end_char"],
-                "text": item["payload"]["text"],
-                "score": item["score"],
-            }
-            for item in payloads
-        ]
+        # Removed since we use query_dataset offline logic directly!
+        return []
 
     def _document_titles_for_results(self, payloads: list[dict[str, Any]]) -> dict[str, str]:
         doc_ids = {

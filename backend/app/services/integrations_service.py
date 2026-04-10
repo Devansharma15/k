@@ -250,11 +250,11 @@ RATE_LIMIT_MAX_ATTEMPTS = 3
 
 NANGO_PROVIDER_MAP = {
     "slack": "slack",
-    "gmail": "google-mail",
+    "gmail": "google-mail",  # Matched to user screenshot
     "notion": "notion",
-    "google-sheets": "google-sheets",
+    "google-sheets": "google-sheet",  # Matched to user screenshot
     "hubspot": "hubspot",
-    "github": "github",
+    "github": "github-getting-started",  # Matched to user screenshot
     "zendesk": "zendesk",
     "intercom": "intercom",
     "linear": "linear",
@@ -498,6 +498,7 @@ class IntegrationsService:
         return {
             "connection_id": connection_id,
             "provider": provider_config["slug"],
+            "nango_integration_id": integration_id,
             "type": "oauth",
             "status": "Pending",
             "connect_session_token": connect_token,
@@ -706,9 +707,24 @@ class IntegrationsService:
                 payload = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
-            raise IntegrationConfigError(
-                f"Nango request failed ({exc.code}): {detail or exc.reason}"
-            ) from exc
+            error_msg = f"Nango request failed ({exc.code}): {detail or exc.reason}"
+            
+            # Enrich error message for common Nango configuration issues
+            if "Integration does not exist" in error_msg:
+                # Try to extract the attempted ID from the body if this was a session creation
+                missing_id = None
+                if body and "allowed_integrations" in body and body["allowed_integrations"]:
+                    missing_id = body["allowed_integrations"][0]
+                
+                instruction = (
+                    f"\n\nFIX: Go to your Nango Dashboard (app.nango.dev), add the integration, "
+                    f"and ensure the 'Unique Key' is set to '{missing_id}'."
+                    if missing_id else
+                    "\n\nFIX: Ensure you have created the matching integration in your Nango Dashboard."
+                )
+                error_msg += instruction
+                
+            raise IntegrationConfigError(error_msg) from exc
         except urllib.error.URLError as exc:
             raise IntegrationConfigError("Could not reach Nango API.") from exc
         return json.loads(payload) if payload else {}
