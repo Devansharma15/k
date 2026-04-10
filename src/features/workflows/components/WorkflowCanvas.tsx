@@ -20,6 +20,8 @@ import "reactflow/dist/style.css";
 
 import type { WorkflowDefinition, WorkflowNodeType } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { Wand2 } from "lucide-react";
+import { getLayoutedElements } from "@/lib/layoutUtils";
 
 import { PlatformNode } from "./nodes/PlatformNode";
 
@@ -164,23 +166,34 @@ export function WorkflowCanvas({
     }
   }, [nodes, edges, onSnapshotChange, snapshot]);
 
+  const applyLayout = useCallback((currentNodes: Node[], currentEdges: Edge[]) => {
+    const { nodes: layoutedNodes, edges: layoutedEdges } = getLayoutedElements(currentNodes, currentEdges);
+    setNodes(layoutedNodes);
+    setEdges(layoutedEdges);
+    window.requestAnimationFrame(() => {
+      rfInstanceRef.current?.fitView({ duration: 500, padding: 0.15 });
+    });
+  }, [setNodes, setEdges]);
+
   const onConnect = useCallback(
     (params: Connection) => {
       if (!isEditable) return;
-      setEdges((current) =>
-        addEdge(
-          {
-            ...params,
-            id: `edge-${crypto.randomUUID()}`,
-            label: "true",
-            animated: true,
-            style: { strokeWidth: 2 },
-          },
-          current,
-        ),
-      );
+      const newEdge = {
+        ...params,
+        id: `edge-${crypto.randomUUID()}`,
+        label: "true",
+        animated: true,
+        style: { strokeWidth: 2 },
+      };
+      
+      setEdges((currentEdges) => {
+        const nextEdges = addEdge(newEdge, currentEdges);
+        // Delay to allow state closure correctly via refs
+        setTimeout(() => applyLayout(nodes, nextEdges), 0);
+        return nextEdges;
+      });
     },
-    [isEditable, setEdges],
+    [isEditable, nodes, applyLayout, setEdges],
   );
 
   const handleNodesChange = useCallback(
@@ -250,9 +263,14 @@ export function WorkflowCanvas({
           warnings: [],
         },
       };
-      setNodes((current) => [...current, newNode]);
+
+      setNodes((currentNodes) => {
+        const nextNodes = [...currentNodes, newNode];
+        setTimeout(() => applyLayout(nextNodes, edges), 0);
+        return nextNodes;
+      });
     },
-    [isEditable, nodeTypesCatalog, setNodes],
+    [isEditable, nodeTypesCatalog, edges, applyLayout, setNodes, flowWrapperRef],
   );
 
   return (
@@ -315,8 +333,18 @@ export function WorkflowCanvas({
         </div>
       </div>
 
-      <div className="pointer-events-none absolute bottom-5 right-5 z-10">
-        <div className="glass rounded-2xl px-4 py-3 text-xs text-muted-foreground">
+      <div className="pointer-events-none absolute bottom-5 right-5 z-10 flex flex-col items-end gap-3">
+        {isEditable && nodes.length > 0 && (
+          <button
+            onClick={() => applyLayout(nodes, edges)}
+            className="pointer-events-auto flex items-center justify-center gap-2 rounded-full border border-primary/30 bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg transition-transform hover:scale-105 active:scale-95"
+            title="Auto-arrange workflow structure"
+          >
+            <Wand2 className="h-4 w-4" />
+            Magic Align
+          </button>
+        )}
+        <div className="glass rounded-2xl px-4 py-3 text-xs text-muted-foreground shadow-md">
           <span className={cn("font-semibold text-foreground")}>{nodes.length}</span> nodes
           <span className="mx-2">•</span>
           <span className={cn("font-semibold text-foreground")}>{edges.length}</span> edges
