@@ -27,8 +27,8 @@ export function getLayoutedElements(
     direction = "LR",
     nodeWidth = 300,
     nodeHeight = 150,
-    ranksep = 100, // Distance between horizontally connected nodes
-    nodesep = 50, // Distance between vertically stacked nodes
+    ranksep = 180, // Horizontal gap strictly pushed for branch clarity
+    nodesep = 100, // Vertical gap explicitly increased to avoid overlap
   } = options;
 
   dagreGraph.setGraph({ rankdir: direction, ranksep, nodesep });

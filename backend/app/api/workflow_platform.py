@@ -37,7 +37,6 @@ async def list_workflows():
 @router.post("/workflows/platform")
 async def create_workflow(request: WorkflowSaveRequest):
     try:
-        workflow_platform_service.validate_snapshot(request.snapshot)
         return workflow_platform_service.create_workflow(request.name, request.snapshot)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

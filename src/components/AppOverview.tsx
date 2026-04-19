@@ -88,13 +88,7 @@ export function AppOverview() {
               {data.product.tagline}
             </p>
             <div className="mt-8 flex flex-wrap gap-3">
-              <Link
-                href="/apps/1"
-                className="inline-flex items-center gap-2 rounded-full bg-white px-5 py-3 text-sm font-semibold text-slate-950 transition-transform hover:-translate-y-0.5"
-              >
-                Open live app
-                <ArrowRight className="h-4 w-4" />
-              </Link>
+
               <Link
                 href="/workflows/1"
                 className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/5 px-5 py-3 text-sm font-semibold text-white transition-colors hover:bg-white/10"

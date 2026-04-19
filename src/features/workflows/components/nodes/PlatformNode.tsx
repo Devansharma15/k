@@ -99,11 +99,32 @@ export const PlatformNode = memo(({ data, selected }: NodeProps) => {
         position={Position.Left}
         className="h-3 w-3 border-2 border-background bg-card"
       />
-      <Handle
-        type="source"
-        position={Position.Right}
-        className="h-3 w-3 border-2 border-background bg-primary"
-      />
+      {data.type.toLowerCase().includes("condition") ||
+      data.type.toLowerCase().includes("branch") ||
+      data.name?.toLowerCase().includes("condition") ? (
+        <>
+          <Handle
+            id="true"
+            type="source"
+            position={Position.Right}
+            style={{ top: "35%" }}
+            className="h-3 w-3 border-2 border-background bg-emerald-500 shadow-md"
+          />
+          <Handle
+            id="false"
+            type="source"
+            position={Position.Right}
+            style={{ top: "65%" }}
+            className="h-3 w-3 border-2 border-background bg-rose-500 shadow-md"
+          />
+        </>
+      ) : (
+        <Handle
+          type="source"
+          position={Position.Right}
+          className="h-3 w-3 border-2 border-background bg-primary shadow-md"
+        />
+      )}
     </div>
   );
 });

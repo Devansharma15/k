@@ -22,7 +22,7 @@ import { motion } from 'framer-motion';
 
 const navItems = [
   { name: 'Dashboard', icon: LayoutDashboard, href: '/' },
-  { name: 'Apps', icon: MessageSquare, href: '/apps' },
+
   { name: 'Workflows', icon: Workflow, href: '/workflows' },
   { name: 'Workflow Templates', icon: CopyPlus, href: '/workflow-templates' },
   { name: 'Knowledge Base', icon: Database, href: '/knowledge-base' },

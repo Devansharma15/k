@@ -1,550 +1,1585 @@
+"""
+AuraFlow — Intelligent Workflow Compiler & System Orchestrator
+==============================================================
+
+Dual-mode system that converts user intent into:
+
+  MODE 1 — WORKFLOW: Deterministic, executable workflow graphs
+  MODE 2 — CODE:     Code-graph-aware answers via MCP context
+
+Workflow Pipeline:
+  1. ModeRouter        — decides workflow vs code mode
+  2. IntentExtractor   — LLM extracts structured JSON intent (regex fallback)
+  3. PatternMatcher    — matches intent → canonical workflow template
+  4. ToolSelector      — filters tools by NODE_TYPES + connected providers
+  5. GraphCompiler     — builds minimal deterministic graph from pattern
+  6. DataMapper        — wires {{node_id.output.field}} bindings
+  7. Validator         — enforces structural + semantic correctness
+  8. ConfidenceScorer  — deterministic 0-100 rubric
+
+Constraints:
+  - EXACTLY one trigger per workflow
+  - NO duplicate nodes (unless pattern explicitly requires)
+  - NO hallucinated or unsupported integrations
+  - NO empty configs — every required field must be populated
+  - Output must pass workflow_platform_service.validate_snapshot()
+"""
+
 from __future__ import annotations
 
+import glob
+import json
+import os
+import pathlib
 import re
+import urllib.error
+import urllib.request
 from typing import Any
+from uuid import uuid4
+
+from .embedding_service import embedding_service
+from .integrations_service import integrations_service
+from .workflow_platform_service import NODE_TYPES
 
 
-NODE_META: dict[str, dict[str, str]] = {
-    "trigger_webhook": {"stage": "trigger", "label": "Webhook Trigger"},
-    "trigger_schedule": {"stage": "trigger", "label": "Scheduled Trigger"},
-    "integration_stripe": {"stage": "trigger", "label": "Stripe Trigger"},
-    "integration_gmail": {"stage": "trigger", "label": "Gmail Trigger"},
-    "integration_http": {"stage": "enrich", "label": "HTTP Enrichment"},
-    "integration_database": {"stage": "enrich", "label": "Knowledge Lookup"},
-    "integration_google_sheets": {"stage": "action", "label": "Google Sheets Action"},
-    "llm_generate": {"stage": "process", "label": "LLM Generate"},
-    "llm_classify": {"stage": "process", "label": "LLM Classify"},
-    "llm_decision": {"stage": "process", "label": "LLM Decision"},
-    "transform": {"stage": "process", "label": "Transform"},
-    "condition": {"stage": "branch", "label": "Condition Branch"},
-    "loop": {"stage": "branch", "label": "Loop Iterator"},
-    "human_approval": {"stage": "branch", "label": "Human Approval"},
-    "sub_workflow": {"stage": "branch", "label": "Sub Workflow"},
-    "integration_email": {"stage": "action", "label": "Email Action"},
-    "integration_slack": {"stage": "notify", "label": "Slack Notify"},
-    "integration_notion": {"stage": "action", "label": "Notion Action"},
-    "integration_hubspot": {"stage": "action", "label": "HubSpot Action"},
-    "integration_zendesk": {"stage": "action", "label": "Zendesk Ticket"},
-    "integration_database_write": {"stage": "action", "label": "Database Write"},
+# ══════════════════════════════════════════════════════════════════════════
+#  MODE ROUTER — decides workflow vs code mode
+# ══════════════════════════════════════════════════════════════════════════
+
+_WORKFLOW_SIGNALS = {
+    "build", "automate", "send", "connect", "create workflow",
+    "trigger", "schedule", "integrate", "bulk", "loop",
+    "email to", "sheets", "telegram", "slack", "discord",
+    "webhook", "rag pipeline", "summarize youtube",
+    "workflow", "automation", "notify",
 }
 
-KEYWORD_MAP: dict[str, list[str]] = {
-    "trigger_schedule": ["schedule", "cron", "daily", "weekly", "every"],
-    "integration_stripe": ["stripe", "payment received", "charge", "invoice"],
-    "integration_gmail": ["email received", "new email", "gmail", "inbox", "mailbox"],
-    "integration_http": ["http", "api", "fetch", "request", "enrich"],
-    "integration_database": ["database", "knowledge", "rag", "vector", "search", "qdrant"],
-    "llm_classify": ["classify", "sentiment", "intent", "score", "triage"],
-    "llm_decision": ["decide", "decision", "risk", "priority", "analyze", "analyse"],
-    "llm_generate": ["generate", "draft", "write", "reply", "answer", "content", "summarize", "summarise"],
-    "condition": ["if", "condition", "branch", "gate", "validate", "check", "refund"],
-    "loop": ["loop", "iterate", "batch", "for each", "retry"],
-    "human_approval": ["approve", "approval", "manual review", "human review", "confirm"],
-    "integration_email": ["reply", "send email", "auto-reply", "respond", "outreach"],
-    "integration_slack": ["slack", "notify", "alert", "channel"],
-    "integration_notion": ["notion"],
-    "integration_hubspot": ["hubspot", "crm", "lead"],
-    "integration_google_sheets": ["google sheets", "sheets", "spreadsheet"],
-    "integration_zendesk": ["ticket", "zendesk", "support ticket", "case"],
-}
-
-AI_KEYWORDS = {"classify", "analyze", "analyse", "summarize", "summarise"}
-PREPROCESS_KEYWORDS = {"enrich", "parse", "extract", "fetch", "lookup", "search"}
-
-INTEGRATION_MAPPING_TABLE: dict[str, dict[str, str]] = {
-    "email": {"node": "integration_gmail", "action": "email_received"},
-    "refund": {"node": "condition", "action": "intent == refund"},
-    "ticket": {"node": "integration_zendesk", "action": "zendesk_ticket"},
-    "reply": {"node": "integration_email", "action": "auto_reply"},
-    "slack": {"node": "integration_slack", "action": "slack_alert"},
-    "hubspot": {"node": "integration_hubspot", "action": "hubspot_action"},
-    "gmail": {"node": "integration_gmail", "action": "gmail_trigger"},
-    "google sheets": {"node": "integration_google_sheets", "action": "google_sheets_action"},
-    "stripe": {"node": "integration_stripe", "action": "stripe_trigger"},
-}
-
-STAGE_ORDER = ["trigger", "enrich", "process", "branch", "action", "notify"]
-STAGE_X = {
-    "trigger": 60,
-    "enrich": 360,
-    "process": 700,
-    "branch": 1040,
-    "action": 1380,
-    "notify": 1720,
+_CODE_SIGNALS = {
+    "why", "error", "bug", "code", "fix", "explain",
+    "how does", "where is", "what does", "trace", "debug",
+    "function", "import", "dependency", "service",
+    "call graph", "architecture", "file", "module",
+    "stack trace", "exception", "crash",
 }
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Stage 1: Parser Agent — extracts structured intent from prompt
-# ═══════════════════════════════════════════════════════════════════
+class ModeRouter:
+    """Decides whether a prompt should trigger WORKFLOW or CODE mode using keyword scoring."""
 
-class PromptParser:
-    """Extract trigger, actions, conditions, integrations, ambiguity flags."""
+    def route(self, prompt: str) -> tuple[str, dict[str, int]]:
+        p = prompt.lower()
 
-    def parse(self, description: str) -> dict[str, Any]:
-        desc = description.lower()
-        trigger = self._detect_trigger(desc)
-        ai_task = self._detect_ai_task(desc)
-        preprocess = self._detect_preprocess(desc)
-        conditions = self._detect_conditions(desc)
-        actions = self._detect_actions(desc)
-        integrations = self._detect_integrations(desc)
-        ambiguity = self._detect_ambiguity(trigger, ai_task, conditions, actions)
-        confidence = self._compute_confidence(trigger, ai_task, conditions, actions, integrations, ambiguity)
+        workflow_score = sum(1 for kw in _WORKFLOW_SIGNALS if kw in p)
+        code_score = sum(1 for kw in _CODE_SIGNALS if kw in p)
 
-        return {
-            "trigger": trigger,
-            "preprocess": preprocess,
-            "ai_task": ai_task,
-            "conditions": conditions,
-            "actions": actions,
-            "integrations": integrations,
-            "ambiguity_flags": ambiguity,
-            "confidence": confidence,
-        }
+        mode_scores = {"workflow": workflow_score, "code": code_score}
 
-    def _detect_trigger(self, desc: str) -> str:
-        if any(kw in desc for kw in ["email received", "new email", "gmail", "inbox"]):
-            return "email_received"
-        if any(kw in desc for kw in ["stripe", "payment received", "charge succeeded"]):
-            return "stripe_payment_received"
-        if any(kw in desc for kw in ["schedule", "cron", "daily", "weekly"]):
-            return "schedule"
-        return "webhook_received"
-
-    def _detect_ai_task(self, desc: str) -> str | None:
-        if "classify" in desc:
-            return "classify_intent"
-        if "analyze" in desc or "analyse" in desc or "score" in desc:
-            return "analyze_input"
-        if "summarize" in desc or "summarise" in desc:
-            return "summarize_content"
-        return None
-
-    def _detect_preprocess(self, desc: str) -> list[str]:
-        steps: list[str] = []
-        if "enrich" in desc:
-            steps.append("enrichment")
-        if any(kw in desc for kw in ["parse", "extract"]):
-            steps.append("parsing")
-        if any(kw in desc for kw in ["fetch", "lookup", "search"]):
-            steps.append("lookup")
-        return steps or ["enrichment"]
-
-    def _detect_conditions(self, desc: str) -> list[str]:
-        conditions: list[str] = []
-        if_clause = re.search(r"\bif\s+([^,.;]+)", desc)
-        if if_clause:
-            conditions.append(if_clause.group(1).strip())
-        amount_condition = re.search(r"amount\s*(>=|<=|>|<|==)\s*(\d+)", desc)
-        if amount_condition:
-            conditions.append(f"amount {amount_condition.group(1)} {amount_condition.group(2)}")
-        if "refund" in desc and not any("refund" in c for c in conditions):
-            conditions.append("intent == refund")
-        if "approve" in desc or "approval" in desc:
-            conditions.append("requires_approval")
-        return conditions
-
-    def _detect_actions(self, desc: str) -> list[str]:
-        actions: list[str] = []
-        for keyword, mapping in INTEGRATION_MAPPING_TABLE.items():
-            if keyword in desc:
-                actions.append(mapping["action"])
-        if "zendesk_ticket" not in actions and "ticket" in desc:
-            actions.append("zendesk_ticket")
-        return actions or ["notify"]
-
-    def _detect_integrations(self, desc: str) -> list[str]:
-        found: list[str] = []
-        integration_keywords = {
-            "slack": "slack", "gmail": "gmail", "stripe": "stripe",
-            "notion": "notion", "hubspot": "hubspot", "zendesk": "zendesk",
-            "sheets": "google-sheets", "github": "github", "shopify": "shopify",
-        }
-        for kw, provider in integration_keywords.items():
-            if kw in desc:
-                found.append(provider)
-        return found
-
-    def _detect_ambiguity(self, trigger: str, ai_task: str | None, conditions: list, actions: list) -> list[str]:
-        flags: list[str] = []
-        if trigger == "webhook_received" and not ai_task and not conditions and not actions:
-            flags.append("no_clear_intent")
-        return flags
-
-    def _compute_confidence(
-        self, trigger: str, ai_task: str | None, conditions: list,
-        actions: list, integrations: list, ambiguity: list,
-    ) -> float:
-        score = 0.3  # baseline
-        if trigger != "webhook_received":
-            score += 0.15
-        if ai_task:
-            score += 0.15
-        if conditions:
-            score += 0.1
-        if len(actions) > 1:
-            score += 0.1
-        if integrations:
-            score += 0.1
-        if ambiguity:
-            score -= 0.3
-        return round(min(max(score, 0.0), 1.0), 2)
+        if code_score > workflow_score:
+            return "code", mode_scores
+        return "workflow", mode_scores
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Stage 2: Planner Agent — converts parsed intent into node plan
-# ═══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  CODE MODE — MCP-style code graph query engine
+# ══════════════════════════════════════════════════════════════════════════
 
-class WorkflowPlanner:
-    """Convert ParsedIntent into ordered execution plan."""
+# Project root (two levels up from this service file)
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
-    def plan(self, description: str, parsed: dict[str, Any]) -> dict[str, Any]:
-        desc_lower = description.lower()
-        node_types = self._extract_intents(desc_lower, parsed)
-        node_types = self._ensure_pipeline(node_types, desc_lower, parsed)
-        confidence = self._compute_plan_confidence(node_types, parsed)
-
-        return {
-            "node_types": node_types,
-            "parsed_intent": parsed,
-            "plan_confidence": confidence,
-        }
-
-    def _extract_intents(self, desc: str, parsed: dict[str, Any]) -> list[str]:
-        scored: list[tuple[str, int]] = []
-        for node_type, keywords in KEYWORD_MAP.items():
-            score = 0
-            for kw in keywords:
-                if len(kw) <= 3:
-                    if re.search(r"\b" + re.escape(kw) + r"\b", desc):
-                        score += 2
-                elif kw in desc:
-                    score += len(kw)
-            if score > 0:
-                scored.append((node_type, score))
-        for keyword, mapping in INTEGRATION_MAPPING_TABLE.items():
-            if keyword in desc:
-                scored.append((mapping["node"], 20))
-        if parsed:
-            trigger = parsed.get("trigger")
-            if trigger == "email_received":
-                scored.append(("integration_gmail", 30))
-            if parsed.get("conditions"):
-                scored.append(("condition", 25))
-            if parsed.get("actions"):
-                for action in parsed["actions"]:
-                    if action == "zendesk_ticket":
-                        scored.append(("integration_zendesk", 25))
-                    if action in {"auto_reply", "email_send"}:
-                        scored.append(("integration_email", 25))
-        scored.sort(key=lambda item: item[1], reverse=True)
-        return [node_type for node_type, _ in scored]
-
-    def _ensure_pipeline(self, node_types: list[str], desc: str, parsed: dict[str, Any]) -> list[str]:
-        types = list(node_types)
-        stages_present = {NODE_META.get(nt, {}).get("stage") for nt in types}
-
-        if "trigger" not in stages_present:
-            types.insert(0, "trigger_webhook")
-        if "action" not in stages_present:
-            types.append("integration_database_write")
-        if "enrich" not in stages_present:
-            types.append("integration_http")
-
-        requires_ai = any(kw in desc for kw in AI_KEYWORDS | {"score"})
-        has_ai = any(nt.startswith("llm_") for nt in types)
-        if requires_ai and not has_ai:
-            if "classify" in desc:
-                types.append("llm_classify")
-            elif "summarize" in desc or "summarise" in desc:
-                types.append("llm_generate")
-            else:
-                types.append("llm_decision")
-
-        if "process" not in {NODE_META.get(nt, {}).get("stage") for nt in types}:
-            types.append("llm_generate")
-        if "branch" not in stages_present:
-            types.append("condition")
-        if "notify" not in stages_present:
-            types.append("integration_slack")
-
-        # Auto-add human_approval if mentioned
-        if any("approv" in kw for kw in (parsed.get("conditions") or [])):
-            if "human_approval" not in types:
-                types.append("human_approval")
-
-        while len(types) < 6:
-            types.append("transform")
-        return types
-
-    def _compute_plan_confidence(self, node_types: list[str], parsed: dict[str, Any]) -> float:
-        score = parsed.get("confidence", 0.5)
-        if len(node_types) >= 4:
-            score += 0.1
-        if any(nt.startswith("llm_") for nt in node_types):
-            score += 0.05
-        return round(min(max(score, 0.0), 1.0), 2)
+# Service graph: file → callable services / relationships
+_SERVICE_GRAPH: dict[str, dict[str, Any]] = {
+    "workflow_architect_service": {
+        "path": "backend/app/services/workflow_architect_service.py",
+        "role": "Workflow compiler — converts prompts to executable graphs",
+        "imports": ["embedding_service", "integrations_service", "workflow_platform_service"],
+        "exports": ["workflow_architect_service"],
+        "api_routes": ["/api/generate-workflow"],
+    },
+    "workflow_platform_service": {
+        "path": "backend/app/services/workflow_platform_service.py",
+        "role": "Workflow execution engine — CRUD, run, validate, publish workflows",
+        "imports": ["integrations_service"],
+        "exports": ["workflow_platform_service", "NODE_TYPES"],
+        "api_routes": ["/api/workflows/platform", "/api/node-types", "/api/templates"],
+    },
+    "integrations_service": {
+        "path": "backend/app/services/integrations_service.py",
+        "role": "Integration hub — manages provider connections (OAuth + API keys)",
+        "imports": [],
+        "exports": ["integrations_service"],
+        "api_routes": ["/api/integrations"],
+    },
+    "embedding_service": {
+        "path": "backend/app/services/embedding_service.py",
+        "role": "Local embedding service — all-MiniLM-L6-v2 for semantic routing",
+        "imports": [],
+        "exports": ["embedding_service"],
+        "api_routes": [],
+    },
+    "knowledge_base_service": {
+        "path": "backend/app/services/knowledge_base_service.py",
+        "role": "RAG pipeline — FAISS + BM25 + cross-encoder reranking",
+        "imports": [],
+        "exports": ["knowledge_base_service"],
+        "api_routes": ["/api/knowledge-base"],
+    },
+}
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Stage 3: Builder Agent — emits final DAG with validation
-# ═══════════════════════════════════════════════════════════════════
+class CodeGraphEngine:
+    """
+    MCP-style code graph query engine.
+    Resolves prompts about code, bugs, and architecture by traversing
+    the project's service graph and file structure.
+    """
 
-class WorkflowBuilder:
-    """Convert WorkflowPlan into final DAG nodes + edges."""
+    def query(self, prompt: str) -> dict[str, Any]:
+        p = prompt.lower()
 
-    def build(self, description: str, plan: dict[str, Any]) -> dict[str, Any]:
-        staged = self._stage(plan["node_types"])
-        parsed = plan.get("parsed_intent") or {}
-        nodes = self._build_nodes(staged, description, parsed)
-        edges = self._build_edges(nodes, staged, parsed)
-        name = self._workflow_name(description)
+        # Find relevant services by keyword
+        relevant: list[dict[str, Any]] = []
+        relationships: list[str] = []
 
-        # Validation pass
-        validation = self._validate_dag(nodes, edges)
-        nodes, edges = self._auto_correct(nodes, edges, validation)
-
-        missing_integrations = self._find_missing_integrations(nodes)
-        build_confidence = self._compute_build_confidence(nodes, edges, validation, plan)
-
-        return {
-            "name": name,
-            "nodes": nodes,
-            "edges": edges,
-            "explanation": self._generate_explanation(description, nodes, edges),
-            "missing_integrations": missing_integrations,
-            "confidence": build_confidence,
-            "needs_confirmation": build_confidence < 0.6,
-            "plan_confidence": plan.get("plan_confidence", 0.5),
-            "parse_confidence": parsed.get("confidence", 0.5),
-        }
-
-    def _stage(self, node_types: list[str]) -> dict[str, list[str]]:
-        staged = {stage: [] for stage in STAGE_ORDER}
-        for nt in node_types:
-            stage = NODE_META.get(nt, {}).get("stage", "process")
-            staged[stage].append(nt)
-        return staged
-
-    def _build_nodes(self, staged: dict[str, list[str]], desc: str, parsed: dict[str, Any]) -> list[dict[str, Any]]:
-        nodes: list[dict[str, Any]] = []
-        counter = 1
-        previous_id = "input"
-        explicit_condition = parsed["conditions"][0] if parsed.get("conditions") else None
-
-        for stage in STAGE_ORDER:
-            for idx, node_type in enumerate(staged[stage]):
-                node_id = str(counter)
-                y = int(220 + (idx - (len(staged[stage]) - 1) / 2) * 170)
-                config = self._node_config(node_type, desc, previous_id, explicit_condition)
-                nodes.append({
-                    "id": node_id,
-                    "type": node_type,
-                    "name": NODE_META.get(node_type, {}).get("label", node_type),
-                    "position": {"x": STAGE_X[stage], "y": y},
-                    "config": config,
-                    "ai_brain": node_type.startswith("llm_"),
-                    "memory": "short_term" if node_type.startswith("llm_") else None,
-                    "retry_policy": {
-                        "max_retries": 2,
-                        "backoff": "exponential",
-                        "retry_on": ["timeout", "api_error"],
-                    },
-                    "timeout_ms": 30000 if node_type.startswith("llm_") else 10000,
-                    "input_mapping": {},
-                    "output_mapping": {},
-                    "on_error": {"strategy": "retry_then_fallback", "max_retries": 2},
-                })
-                previous_id = node_id
-                counter += 1
-        return nodes
-
-    def _node_config(self, node_type: str, desc: str, prev_id: str, explicit_condition: str | None = None) -> dict[str, Any]:
-        ref = "{{" + prev_id + ".output}}"
-        configs: dict[str, dict[str, Any]] = {
-            "trigger_webhook": {"path": "/webhooks/generated-workflow"},
-            "trigger_schedule": {"cron": "0 9 * * *"},
-            "integration_stripe": {"action": "payment_received"},
-            "integration_http": {"action": "fetch", "url": "https://api.example.com/data", "input": ref},
-            "integration_database": {"action": "search", "query": ref, "top_k": 5},
-            "llm_classify": {"prompt": f"Classify and score: {desc}", "input": ref},
-            "llm_decision": {"prompt": f"Make routing decision for: {desc}", "input": ref},
-            "llm_generate": {"prompt": f"Generate best output for: {desc}", "input": ref},
-            "condition": {"expression": explicit_condition or "True"},
-            "loop": {"items_path": "items"},
-            "transform": {"template": "{{input}}"},
-            "human_approval": {"message": "Manual approval required for this step."},
-            "sub_workflow": {"workflow_id": ""},
-            "integration_email": {"action": "send_email", "body": ref},
-            "integration_gmail": {"action": "new_message", "folder": "INBOX"},
-            "integration_slack": {"action": "send_message", "message": ref},
-            "integration_notion": {"action": "create_page", "content": ref},
-            "integration_hubspot": {"action": "create_or_update_contact", "payload": ref},
-            "integration_google_sheets": {"action": "append_row", "payload": ref},
-            "integration_zendesk": {"action": "create_ticket", "payload": ref},
-            "integration_database_write": {"action": "upsert_record", "payload": ref},
-        }
-        return configs.get(node_type, {"input": ref})
-
-    def _build_edges(self, nodes: list[dict[str, Any]], staged: dict[str, list[str]], parsed: dict[str, Any]) -> list[dict[str, Any]]:
-        edges: list[dict[str, Any]] = []
-        by_stage: dict[str, list[str]] = {stage: [] for stage in STAGE_ORDER}
-        for node in nodes:
-            stage = NODE_META.get(node["type"], {}).get("stage", "process")
-            by_stage[stage].append(node["id"])
-
-        edge_counter = 1
-        previous_stage_nodes: list[str] = []
-        for stage in STAGE_ORDER:
-            current = by_stage[stage]
-            if not current:
+        for svc_name, meta in _SERVICE_GRAPH.items():
+            # Check if the service or its role is mentioned
+            if svc_name.replace("_", " ") in p or svc_name in p:
+                relevant.append({"service": svc_name, **meta})
                 continue
-            if previous_stage_nodes:
-                if len(previous_stage_nodes) == 1 and len(current) == 1:
-                    edges.append(self._edge(edge_counter, previous_stage_nodes[0], current[0]))
-                    edge_counter += 1
-                elif len(previous_stage_nodes) == 1:
-                    for target in current:
-                        edges.append(self._edge(edge_counter, previous_stage_nodes[0], target))
-                        edge_counter += 1
-                elif len(current) == 1:
-                    for source in previous_stage_nodes:
-                        edges.append(self._edge(edge_counter, source, current[0]))
-                        edge_counter += 1
-                else:
-                    for target in current:
-                        edges.append(self._edge(edge_counter, previous_stage_nodes[-1], target))
-                        edge_counter += 1
-            previous_stage_nodes = current
+            # Check if any of its API routes are mentioned
+            for route in meta.get("api_routes", []):
+                if route in p:
+                    relevant.append({"service": svc_name, **meta})
+                    break
+            # Check role keywords
+            role_words = meta.get("role", "").lower().split()
+            if any(w in p for w in role_words if len(w) > 4):
+                relevant.append({"service": svc_name, **meta})
 
-        # Condition branching
-        condition_nodes = [n["id"] for n in nodes if n["type"] == "condition"]
-        action_nodes = by_stage.get("action", [])
-        notify_nodes = by_stage.get("notify", [])
-        for cond_id in condition_nodes:
-            if action_nodes:
-                edges.append(self._edge(edge_counter, cond_id, action_nodes[0], "result['result'] == True"))
-                edge_counter += 1
-            false_target = notify_nodes[0] if notify_nodes else None
-            if false_target:
-                edges.append(self._edge(edge_counter, cond_id, false_target, "result['result'] == False"))
-                edge_counter += 1
-
-        # Loop feeds process
-        loop_nodes = [n["id"] for n in nodes if n["type"] == "loop"]
-        process_nodes = by_stage.get("process", [])
-        for loop_id in loop_nodes:
-            if process_nodes:
-                edges.append(self._edge(edge_counter, loop_id, process_nodes[0]))
-                edge_counter += 1
-
-        # Deduplicate
-        unique: set[tuple[str, str, str]] = set()
+        # Deduplicate & rank
+        seen: set[str] = set()
         deduped: list[dict[str, Any]] = []
-        for edge in edges:
-            key = (edge["source"], edge["target"], edge["condition"])
-            if key not in unique:
-                unique.add(key)
-                deduped.append(edge)
-        return deduped
+        for r in sorted(relevant, key=lambda x: x.get("score, 0"), reverse=True):
+            if r["service"] not in seen:
+                deduped.append(r)
+                seen.add(r["service"])
+        relevant = deduped[:5]
 
-    def _edge(self, counter: int, source: str, target: str, condition: str = "true") -> dict[str, Any]:
-        return {"id": f"edge-{counter}", "source": source, "target": target, "condition": condition}
+        # Build relationship edges
+        for svc in relevant:
+            for imp in svc.get("imports", []):
+                relationships.append(f"{svc['service']} → imports → {imp}")
 
-    def _validate_dag(self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, Any]:
-        node_ids = {n["id"] for n in nodes}
-        issues: list[str] = []
-        for edge in edges:
-            if edge["source"] not in node_ids:
-                issues.append(f"Edge {edge['id']} has invalid source {edge['source']}")
-            if edge["target"] not in node_ids:
-                issues.append(f"Edge {edge['id']} has invalid target {edge['target']}")
-        targets = {e["target"] for e in edges}
-        orphans = [n["id"] for n in nodes if n["id"] not in targets and NODE_META.get(n["type"], {}).get("stage") != "trigger"]
-        if orphans:
-            issues.append(f"Orphan nodes with no incoming edges: {orphans}")
-        return {"valid": len(issues) == 0, "issues": issues}
+        # If no matches, scan project files for keyword hits
+        if not relevant:
+            relevant, relationships = self._scan_files(p)
 
-    def _auto_correct(self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]], validation: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        # Remove edges pointing to non-existent nodes
-        node_ids = {n["id"] for n in nodes}
-        edges = [e for e in edges if e["source"] in node_ids and e["target"] in node_ids]
-        return nodes, edges
+        # Build explanation
+        explanation = self._explain(prompt, relevant, relationships)
 
-    def _find_missing_integrations(self, nodes: list[dict[str, Any]]) -> list[str]:
-        missing: list[str] = []
+        return {
+            "mode": "code",
+            "explanation": explanation,
+            "relevant_nodes": relevant,
+            "relationships": relationships,
+        }
+
+    def _scan_files(self, query: str) -> tuple[list[dict[str, Any]], list[str]]:
+        """Fallback: scan Python files for the query keyword."""
+        results: list[dict[str, Any]] = []
+        backend_dir = _PROJECT_ROOT / "backend" / "app"
+        if not backend_dir.exists():
+            return results, []
+
+        keywords = [w for w in query.split() if len(w) > 3]
+        if not keywords:
+            return results, []
+
+        for py_file in backend_dir.rglob("*.py"):
+            try:
+                content = py_file.read_text(encoding="utf-8", errors="ignore")
+                lower_content = content.lower()
+                if any(kw in lower_content for kw in keywords):
+                    # Extract function names that match
+                    funcs = re.findall(r"def (\w+)\(", content)
+                    matching_funcs = [
+                        f for f in funcs
+                        if any(kw in f.lower() for kw in keywords)
+                    ]
+                    results.append({
+                        "file": str(py_file.relative_to(_PROJECT_ROOT)),
+                        "matching_functions": matching_funcs[:5],
+                    })
+            except Exception:
+                continue
+
+        return results[:10], []
+
+    def _explain(self, prompt: str, nodes: list, relationships: list) -> str:
+        if not nodes:
+            return f"No code graph nodes found matching: {prompt}"
+        parts = [f"Found {len(nodes)} relevant code node(s):"]
         for node in nodes:
-            if node["type"].startswith("integration_"):
-                provider = node["type"].replace("integration_", "")
-                if provider not in {"http", "database", "database_write", "email", "log_fetch", "document_parser", "enrichment_api", "accounting", "inventory"}:
-                    missing.append(provider)
-        return missing
-
-    def _compute_build_confidence(self, nodes: list, edges: list, validation: dict, plan: dict) -> float:
-        score = plan.get("plan_confidence", 0.5)
-        if validation["valid"]:
-            score += 0.1
-        else:
-            score -= 0.2
-        if len(nodes) >= 4 and len(edges) >= 3:
-            score += 0.1
-        return round(min(max(score, 0.0), 1.0), 2)
-
-    def _generate_explanation(self, desc: str, nodes: list, edges: list) -> str:
-        node_summary = ", ".join(n["name"] for n in nodes[:6])
-        return f"Generated {len(nodes)}-node workflow with {len(edges)} connections: {node_summary}. Based on prompt: \"{desc[:100]}...\""
-
-    def _workflow_name(self, desc: str) -> str:
-        d = desc.lower()
-        if "support" in d:
-            return "Support Triage Automation"
-        if "lead" in d:
-            return "Lead Qualification Workflow"
-        if "payment" in d or "fraud" in d:
-            return "Payment Risk Workflow"
-        if "social" in d:
-            return "Social Content Workflow"
-        if "knowledge" in d or "rag" in d:
-            return "Knowledge Assistant Workflow"
-        if "invoice" in d:
-            return "Invoice Processing Workflow"
-        if "approval" in d:
-            return "Approval Workflow"
-        return "Generated Workflow"
+            if "service" in node:
+                parts.append(f"  • {node['service']}: {node.get('role', 'N/A')}")
+                parts.append(f"    Path: {node.get('path', 'N/A')}")
+            elif "file" in node:
+                parts.append(f"  • {node['file']}")
+                if node.get("matching_functions"):
+                    parts.append(f"    Functions: {', '.join(node['matching_functions'])}")
+        if relationships:
+            parts.append("\nRelationships:")
+            for r in relationships:
+                parts.append(f"  {r}")
+        return "\n".join(parts)
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Orchestrator — runs all 3 stages
-# ═══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  TOOL REGISTRY ADAPTER
+#  Normalizes workflow_platform_service.NODE_TYPES into compiler metadata.
+# ══════════════════════════════════════════════════════════════════════════
 
-class AuraFlowWorkflowArchitect:
-    """3-stage pipeline: Parser → Planner → Builder with confidence scoring."""
+_NODE_TYPE_MAP: dict[str, dict[str, Any]] = {n["type"]: n for n in NODE_TYPES}
+
+
+def _get_available_integrations() -> list[dict[str, str]]:
+    """Flatten integrations_service into [{provider, status}]."""
+    try:
+        data = integrations_service.get_integrations()
+        flat: list[dict[str, str]] = []
+        for cat in data.get("categories", []):
+            for prov in cat.get("providers", []):
+                flat.append({
+                    "provider": prov["slug"].lower(),
+                    "status": "connected" if prov.get("status") == "Connected" else "not_connected",
+                })
+        return flat
+    except Exception:
+        return []
+
+
+def _connected_providers() -> set[str]:
+    return {p["provider"] for p in _get_available_integrations() if p["status"] == "connected"}
+
+
+def _provider_for_type(node_type: str) -> str | None:
+    return _NODE_TYPE_MAP.get(node_type, {}).get("provider_slug")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  NODE OUTPUT SCHEMAS  — compiler-owned, keyed by node type
+# ══════════════════════════════════════════════════════════════════════════
+
+NODE_OUTPUT_SCHEMAS: dict[str, list[str]] = {
+    "trigger_webhook":             ["payload", "headers", "method"],
+    "trigger_schedule":            ["triggered_at"],
+    "integration_google_sheets":   ["rows", "updated_range", "updated_rows"],
+    "integration_gmail":           ["status", "message_id", "from", "subject", "body"],
+    "integration_qdrant":          ["matches", "count"],
+    "integration_telegram":        ["message_id", "chat_id", "text"],
+    "integration_discord":         ["message_id"],
+    "integration_slack":           ["message_id", "channel"],
+    "llm_generate":                ["text", "tokens_used"],
+    "llm_classify":                ["category", "confidence", "categories"],
+    "llm_decision":                ["decision", "intent", "extracted"],
+    "loop":                        ["item", "index"],
+    "transform":                   ["result"],
+    "condition":                   ["result"],
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SEMANTIC ROUTER (Dify-style tool similarity matching)
+# ══════════════════════════════════════════════════════════════════════════
+
+class DifySemanticRouter:
+    """
+    Embeds tool descriptions into latent space and cosine-matches against
+    the user prompt to discover integrations not mentioned by keyword.
+    """
 
     def __init__(self) -> None:
-        self.parser = PromptParser()
-        self.planner = WorkflowPlanner()
-        self.builder = WorkflowBuilder()
+        self._tool_embeddings: dict[str, list[float]] = {}
+        self._is_initialized: bool = False
+
+    def _initialize(self) -> None:
+        if self._is_initialized:
+            return
+        try:
+            texts, keys = [], []
+            for n in NODE_TYPES:
+                slug = n.get("provider_slug")
+                if slug:
+                    txt = f"Platform: {slug}. Label: {n.get('label')}. Family: {n.get('family')}."
+                    texts.append(txt)
+                    keys.append(n["type"])
+            if texts:
+                embedded = embedding_service.embed_batch(texts)
+                for k, vec in zip(keys, embedded):
+                    self._tool_embeddings[k] = vec
+                self._is_initialized = True
+        except Exception:
+            pass
+
+    def route_platforms(self, prompt: str, threshold: float = 0.35) -> list[str]:
+        self._initialize()
+        if not self._is_initialized:
+            return []
+        try:
+            prompt_vec = embedding_service.embed(prompt)
+            matches = []
+            for t_type, t_vec in self._tool_embeddings.items():
+                sim = sum(a * b for a, b in zip(prompt_vec, t_vec))
+                if sim >= threshold:
+                    slug = _provider_for_type(t_type)
+                    if slug:
+                        matches.append((slug, sim))
+            matches.sort(key=lambda x: x[1], reverse=True)
+            seen: set[str] = set()
+            dedup: list[str] = []
+            for prov, _ in matches:
+                if prov not in seen:
+                    dedup.append(prov)
+                    seen.add(prov)
+            return dedup
+        except Exception:
+            return []
+
+
+_semantic_router = DifySemanticRouter()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FEW-SHOT CANONICAL TEMPLATES  (5 training workflows)
+# ══════════════════════════════════════════════════════════════════════════
+
+CANONICAL_PATTERNS: dict[str, dict[str, Any]] = {
+    # ── Template 1: Data Analysis Chatbot ─────────────────────────────
+    "data_analysis": {
+        "name": "Data Analysis Chatbot",
+        "description": "Analyze Google Sheets data and answer questions",
+        "example_prompts": [
+            "analyze my google sheets data and answer questions",
+            "read spreadsheet and summarize the data",
+            "get data from sheets and generate insights",
+        ],
+        "roles": [
+            {"role": "trigger",   "node_type": "trigger_webhook",           "required": True},
+            {"role": "data",      "node_type": "integration_google_sheets", "required": True},
+            {"role": "llm",       "node_type": "llm_generate",              "required": True},
+            {"role": "response",  "node_type": "transform",                 "required": True},
+        ],
+    },
+    # ── Template 2: RAG Chatbot ───────────────────────────────────────
+    "rag": {
+        "name": "RAG Knowledge Assistant",
+        "description": "Answer questions from a knowledge base / documents",
+        "example_prompts": [
+            "answer questions from my knowledge base",
+            "rag pipeline for documents",
+            "search my documents and answer",
+            "knowledge base chatbot",
+        ],
+        "roles": [
+            {"role": "trigger",   "node_type": "trigger_webhook",     "required": True},
+            {"role": "retriever", "node_type": "integration_qdrant",  "required": True},
+            {"role": "llm",       "node_type": "llm_generate",        "required": True},
+            {"role": "response",  "node_type": "transform",           "required": True},
+        ],
+    },
+    # ── Template 3: YouTube Summarizer ────────────────────────────────
+    "youtube_summarization": {
+        "name": "YouTube Summarizer",
+        "description": "Summarize YouTube videos from transcripts",
+        "example_prompts": [
+            "summarize youtube videos",
+            "get youtube transcript and summarize",
+        ],
+        "roles": [
+            {"role": "trigger",    "node_type": "trigger_webhook",     "required": True},
+            {"role": "transcript", "node_type": "integration_youtube_transcript", "required": True},
+            {"role": "llm",        "node_type": "llm_generate",        "required": True},
+        ],
+    },
+    # ── Template 4: Bulk Email Sender ─────────────────────────────────
+    "bulk_email": {
+        "name": "Bulk Email Sender",
+        "description": "Send emails to contacts from Google Sheets",
+        "example_prompts": [
+            "send emails from google sheets list",
+            "bulk email from spreadsheet",
+            "mass email using sheets data",
+        ],
+        "roles": [
+            {"role": "trigger", "node_type": "trigger_webhook",           "required": True},
+            {"role": "data",    "node_type": "integration_google_sheets", "required": True},
+            {"role": "loop",    "node_type": "loop",                      "required": True},
+            {"role": "action",  "node_type": "integration_gmail",         "required": True},
+        ],
+    },
+    # ── Template 5: Chat Automation (Telegram) ────────────────────────
+    "chat_automation": {
+        "name": "Chat Automation",
+        "description": "Reply to Telegram messages using AI",
+        "example_prompts": [
+            "reply to telegram messages using ai",
+            "telegram chatbot",
+            "auto-reply telegram messages",
+        ],
+        "roles": [
+            {"role": "trigger",  "node_type": "trigger_webhook",       "required": True},
+            {"role": "llm",      "node_type": "llm_generate",          "required": True},
+            {"role": "response", "node_type": "integration_telegram",  "required": True},
+        ],
+    },
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 1 — INTENT EXTRACTOR  (LLM-driven with regex fallback)
+# ══════════════════════════════════════════════════════════════════════════
+
+_INTENT_SYSTEM_PROMPT = """\
+You are an intent classifier for AuraFlow, a workflow automation platform.
+Extract structured intent from the user's prompt.
+
+You MUST return valid JSON with these fields:
+{
+  "workflow_type": "data_analysis | rag | youtube_summarization | bulk_email | chat_automation | generic",
+  "input_mode": "chat | webhook | schedule",
+  "requires_llm": true/false,
+  "requires_loop": true/false,
+  "target_integrations": ["provider_slug_1", "provider_slug_2"]
+}
+
+Available provider slugs: google-sheets, gmail, qdrant, telegram, discord, slack,
+notion, stripe, hubspot, github, zendesk, twitter, linkedin, shopify, sentry.
+
+ONLY return the JSON object. No markdown, no explanation."""
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 0 — COMPILER INPUTS RESOLVER
+# ══════════════════════════════════════════════════════════════════════════
+
+class CompilerInputsResolver:
+    """
+    Stage 0: Prepares global compiler context before generation.
+    Fetches available integrations, normalizes provider names,
+    and returns downstream inputs.
+    """
+    def resolve(self) -> dict[str, Any]:
+        return {
+            "connected_providers": list(_connected_providers()),
+            "node_types": _NODE_TYPE_MAP
+        }
+
+
+
+
+class IntentExtractor:
+    """
+    Stage 1: Converts natural-language prompt → structured intent JSON.
+    Primary path: LLM extraction.
+    Fallback: deterministic regex parser (reduces confidence).
+    """
+
+    def extract(self, prompt: str) -> dict[str, Any]:
+        # Try LLM extraction first
+        llm_result = self._try_llm_extract(prompt)
+        if llm_result is not None:
+            llm_result["_source"] = "llm"
+            llm_result["raw_prompt"] = prompt
+            return llm_result
+
+        # Fallback: deterministic regex parser
+        result = self._regex_extract(prompt)
+        result["_source"] = "regex_fallback"
+        result["raw_prompt"] = prompt
+        return result
+
+    # ── LLM path ──────────────────────────────────────────────────────
+
+    def _try_llm_extract(self, prompt: str) -> dict[str, Any] | None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            # Also try Gemini
+            return self._try_gemini_extract(prompt)
+        try:
+            payload = {
+                "model": os.getenv("OPENAI_WORKFLOW_MODEL", "gpt-4.1-mini"),
+                "messages": [
+                    {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.0,
+            }
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            text = body["choices"][0]["message"]["content"]
+            return self._parse_llm_json(text)
+        except Exception:
+            return self._try_gemini_extract(prompt)
+
+    def _try_gemini_extract(self, prompt: str) -> dict[str, Any] | None:
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            return None
+        try:
+            payload = {
+                "contents": [
+                    {"parts": [{"text": f"{_INTENT_SYSTEM_PROMPT}\n\nUser prompt: {prompt}"}]}
+                ],
+            }
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            text = body["candidates"][0]["content"]["parts"][0]["text"]
+            return self._parse_llm_json(text)
+        except Exception:
+            return None
+
+    def _parse_llm_json(self, text: str) -> dict[str, Any] | None:
+        """Parse JSON from LLM output, stripping markdown fences if present."""
+        cleaned = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`")
+        try:
+            parsed = json.loads(cleaned)
+            # Validate expected shape
+            if "workflow_type" in parsed and "target_integrations" in parsed:
+                return {
+                    "workflow_type": str(parsed.get("workflow_type", "generic")),
+                    "input_mode": str(parsed.get("input_mode", "webhook")),
+                    "requires_llm": bool(parsed.get("requires_llm", False)),
+                    "requires_loop": bool(parsed.get("requires_loop", False)),
+                    "target_integrations": list(parsed.get("target_integrations", [])),
+                }
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
+        return None
+
+    # ── Regex fallback ────────────────────────────────────────────────
+
+    def _regex_extract(self, prompt: str) -> dict[str, Any]:
+        p = prompt.lower()
+
+        # Detect workflow type
+        workflow_type = "generic"
+        requires_llm = False
+        requires_loop = False
+        target_integrations: list[str] = []
+
+        if ("sheet" in p or "spreadsheet" in p) and any(w in p for w in ["analyze", "analyse", "summarize", "answer", "insight"]):
+            workflow_type = "data_analysis"
+            requires_llm = True
+            target_integrations.append("google-sheets")
+
+        elif any(w in p for w in ["knowledge base", "knowledge", "rag", "document"]) and any(w in p for w in ["answer", "search", "query", "chat"]):
+            workflow_type = "rag"
+            requires_llm = True
+            if "qdrant" not in target_integrations:
+                target_integrations.append("qdrant")
+
+        elif "youtube" in p and any(w in p for w in ["summar", "transcript"]):
+            workflow_type = "youtube_summarization"
+            requires_llm = True
+
+        elif "bulk" in p and "email" in p:
+            workflow_type = "bulk_email"
+            requires_loop = True
+            target_integrations.extend(["google-sheets", "gmail"])
+
+        elif "telegram" in p and any(w in p for w in ["reply", "respond", "chat", "bot", "message"]):
+            workflow_type = "chat_automation"
+            requires_llm = True
+            target_integrations.append("telegram")
+
+        elif "discord" in p and any(w in p for w in ["reply", "respond", "chat", "bot"]):
+            workflow_type = "chat_automation"
+            requires_llm = True
+            target_integrations.append("discord")
+
+        # Detect any remaining integrations mentioned by keyword
+        kw_map = {
+            "google-sheets": ["google sheets", "sheets", "spreadsheet"],
+            "gmail": ["gmail", "email"],
+            "slack": ["slack"],
+            "notion": ["notion"],
+            "telegram": ["telegram"],
+            "discord": ["discord"],
+            "qdrant": ["qdrant", "vector"],
+            "hubspot": ["hubspot", "crm"],
+            "github": ["github"],
+            "zendesk": ["zendesk"],
+            "stripe": ["stripe", "payment"],
+            "twitter": ["twitter", "tweet"],
+            "linkedin": ["linkedin"],
+            "shopify": ["shopify"],
+            "sentry": ["sentry"],
+        }
+        for slug, keywords in kw_map.items():
+            if any(kw in p for kw in keywords) and slug not in target_integrations:
+                target_integrations.append(slug)
+
+        # Semantic routing supplement
+        if len(target_integrations) <= 1:
+            for slug in _semantic_router.route_platforms(p)[:2]:
+                if slug not in target_integrations:
+                    target_integrations.append(slug)
+
+        # Detect input mode
+        input_mode = "webhook"
+        if any(w in p for w in ["schedule", "daily", "weekly", "hourly", "cron", "every"]):
+            input_mode = "schedule"
+        elif any(w in p for w in ["chat", "message", "reply", "respond"]):
+            input_mode = "chat"
+
+        # Detect LLM need
+        if any(w in p for w in ["analyze", "summarize", "generate", "classify", "answer",
+                                 "draft", "write", "respond", "reply", "translate",
+                                 "extract", "parse", "decide"]):
+            requires_llm = True
+
+        return {
+            "workflow_type": workflow_type,
+            "input_mode": input_mode,
+            "requires_llm": requires_llm,
+            "requires_loop": requires_loop,
+            "target_integrations": target_integrations,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 2 — PATTERN MATCHER  (few-shot + rules)
+# ══════════════════════════════════════════════════════════════════════════
+
+class PatternMatcher:
+    """
+    Stage 2: Matches structured intent to a canonical workflow pattern.
+    Returns pattern definition with roles, or 'generic' fallback.
+    """
+
+    def match(self, intent: dict[str, Any]) -> dict[str, Any]:
+        wf_type = intent.get("workflow_type", "generic")
+
+        # Direct match
+        if wf_type in CANONICAL_PATTERNS:
+            pattern = dict(CANONICAL_PATTERNS[wf_type])
+            pattern["matched_type"] = wf_type
+            pattern["is_supported"] = True
+            # YouTube: check if transcript node exists
+            if wf_type == "youtube_summarization":
+                if "integration_youtube_transcript" not in _NODE_TYPE_MAP:
+                    pattern["is_supported"] = False
+                    pattern["unsupported_reason"] = "No transcript node in NODE_TYPES"
+            return pattern
+
+        # Fallback: try to infer from target_integrations
+        targets = set(intent.get("target_integrations", []))
+        if "google-sheets" in targets and intent.get("requires_loop") and "gmail" in targets:
+            pattern = dict(CANONICAL_PATTERNS["bulk_email"])
+            pattern["matched_type"] = "bulk_email"
+            pattern["is_supported"] = True
+            return pattern
+        if "qdrant" in targets and intent.get("requires_llm"):
+            pattern = dict(CANONICAL_PATTERNS["rag"])
+            pattern["matched_type"] = "rag"
+            pattern["is_supported"] = True
+            return pattern
+        if "telegram" in targets and intent.get("requires_llm"):
+            pattern = dict(CANONICAL_PATTERNS["chat_automation"])
+            pattern["matched_type"] = "chat_automation"
+            pattern["is_supported"] = True
+            return pattern
+
+        # Generic fallback
+        return {
+            "matched_type": "generic",
+            "name": "Generic Workflow",
+            "description": "Custom workflow generated from prompt",
+            "roles": self._build_generic_roles(intent),
+            "is_supported": True,
+        }
+
+    def _build_generic_roles(self, intent: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build a minimal role list for unrecognized patterns."""
+        trigger_type = "trigger_schedule" if intent.get("input_mode") == "schedule" else "trigger_webhook"
+        roles: list[dict[str, Any]] = [
+            {"role": "trigger", "node_type": trigger_type, "required": True},
+        ]
+
+        # Add integration nodes for each target
+        for slug in intent.get("target_integrations", []):
+            itype = self._slug_to_node_type(slug)
+            if itype and itype in _NODE_TYPE_MAP:
+                roles.append({"role": "integration", "node_type": itype, "required": True})
+
+        # Add LLM if needed
+        if intent.get("requires_llm"):
+            roles.append({"role": "llm", "node_type": "llm_generate", "required": True})
+
+        # Add loop if needed
+        if intent.get("requires_loop"):
+            roles.append({"role": "loop", "node_type": "loop", "required": True})
+
+        # Add response transform
+        roles.append({"role": "response", "node_type": "transform", "required": False})
+
+        return roles
+
+    @staticmethod
+    def _slug_to_node_type(slug: str) -> str | None:
+        for n in NODE_TYPES:
+            if n.get("provider_slug") == slug:
+                return n["type"]
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 3 — TOOL SELECTOR  (NODE_TYPES + connected integrations)
+# ══════════════════════════════════════════════════════════════════════════
+
+class ToolSelector:
+    """
+    Stage 3: Validates that every role in the pattern can be fulfilled by
+    a node in NODE_TYPES whose provider (if any) is connected.
+    """
+
+    def select(self, pattern: dict[str, Any]) -> dict[str, Any]:
+        connected = _connected_providers()
+        selected: list[dict[str, Any]] = []
+        missing_integrations: list[str] = []
+        is_supported = pattern.get("is_supported", True)
+
+        for role_def in pattern.get("roles", []):
+            node_type = role_def["node_type"]
+
+            # Reject if node type does not exist in NODE_TYPES
+            if node_type not in _NODE_TYPE_MAP:
+                is_supported = False
+                continue
+
+            meta = _NODE_TYPE_MAP[node_type]
+            provider = meta.get("provider_slug")
+
+            # Track missing provider connections
+            if provider and provider not in connected:
+                missing_integrations.append(provider)
+
+            selected.append({
+                "role": role_def["role"],
+                "node_type": node_type,
+                "provider": provider,
+                "label": meta.get("label", node_type),
+                "default_config": dict(meta.get("default_config", {})),
+                "connected": provider is None or provider in connected,
+            })
+
+        return {
+            "selected_tools": selected,
+            "missing_integrations": list(dict.fromkeys(missing_integrations)),
+            "is_supported": is_supported,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  NODE ID HELPERS — human-readable deterministic IDs
+# ══════════════════════════════════════════════════════════════════════════
+
+# Maps node_type → short readable slug used in IDs.
+_NODE_ID_SLUG: dict[str, str] = {
+    "trigger_webhook":           "trigger_webhook",
+    "trigger_schedule":          "trigger_schedule",
+    "integration_google_sheets": "sheets",
+    "integration_gmail":         "gmail_send",
+    "integration_qdrant":        "qdrant_search",
+    "integration_telegram":      "telegram",
+    "integration_discord":       "discord",
+    "integration_slack":         "slack",
+    "integration_notion":        "notion",
+    "integration_stripe":        "stripe",
+    "integration_hubspot":       "hubspot",
+    "integration_github":        "github",
+    "integration_zendesk":       "zendesk",
+    "integration_twitter":       "twitter",
+    "integration_linkedin":      "linkedin",
+    "integration_shopify":       "shopify",
+    "integration_sentry":        "sentry",
+    "integration_document_parser": "doc_parser",
+    "llm_generate":              "llm_generate",
+    "llm_classify":              "llm_classify",
+    "llm_decision":              "llm_decision",
+    "loop":                      "loop",
+    "transform":                 "transform",
+    "condition":                 "condition",
+    "delay":                     "delay",
+    "sub_workflow":              "sub_workflow",
+    "human_approval":            "approval",
+}
+
+
+def _make_node_id(node_type: str, counters: dict[str, int]) -> str:
+    """Generate a deterministic human-readable node ID like sheets_1, gmail_send_1."""
+    slug = _NODE_ID_SLUG.get(node_type, node_type)
+    counters[slug] = counters.get(slug, 0) + 1
+    return f"{slug}_{counters[slug]}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 4 — GRAPH COMPILER  (deterministic structure from pattern)
+# ══════════════════════════════════════════════════════════════════════════
+
+class GraphCompiler:
+    """
+    Stage 4: Builds a minimal, deterministic workflow graph.
+    Rules:
+      - Exactly one trigger
+      - Deterministic node IDs: trigger_webhook_1, sheets_1, llm_generate_1, gmail_send_1
+      - Configs seeded from default_config + compiler overrides
+      - Minimal edges — sequential chain, no template padding
+      - Loop only for bulk patterns; router only if required
+    """
+
+    _X_START = 100
+    _X_STEP = 280
+    _Y_CENTER = 300
+
+    def compile(self, intent: dict[str, Any], tool_selection: dict[str, Any]) -> dict[str, Any]:
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        id_counters: dict[str, int] = {}
+        prev_node_id: str | None = None
+
+        for idx, tool in enumerate(tool_selection["selected_tools"]):
+            node_type = tool["node_type"]
+            node_id = _make_node_id(node_type, id_counters)
+
+            config = dict(tool.get("default_config", {}))
+            self._apply_pattern_config(intent, tool, config)
+
+            is_ai = node_type.startswith("llm_")
+            provider = tool.get("provider") or None
+            action = config.get("action") or _NODE_TYPE_MAP.get(node_type, {}).get("default_config", {}).get("action") or None
+            node = {
+                "id": node_id,
+                "type": node_type,
+                "provider": provider,
+                "action": action,
+                "name": tool.get("label", node_type),
+                "position": {"x": self._X_START + idx * self._X_STEP, "y": self._Y_CENTER},
+                "config": config,
+                "input_mapping": {},
+                "output_mapping": {},
+                "ai_brain": is_ai,
+                "memory": "short_term" if is_ai else None,
+                "retry_policy": {"max_retries": 2, "backoff": "exponential", "retry_on": ["timeout", "api_error"]},
+                "timeout_ms": 30000 if is_ai else 10000,
+            }
+            nodes.append(node)
+
+            if prev_node_id is not None:
+                edges.append({
+                    "id": f"edge-{uuid4().hex[:8]}",
+                    "source": prev_node_id,
+                    "target": node_id,
+                    "condition": "true",
+                })
+            prev_node_id = node_id
+
+        return {"nodes": nodes, "edges": edges}
+
+    def _apply_pattern_config(self, intent: dict[str, Any], tool: dict[str, Any], config: dict[str, Any]) -> None:
+        """Override default_config with pattern-specific values."""
+        node_type = tool["node_type"]
+        wf_type = intent.get("workflow_type", "generic")
+        prompt = intent.get("raw_prompt", "")
+
+        if node_type == "trigger_webhook":
+            config["path"] = f"/webhooks/{wf_type.replace('_', '-')}"
+
+        elif node_type == "trigger_schedule":
+            config["cron"] = "0 9 * * *"
+
+        elif node_type == "integration_google_sheets":
+            if wf_type in ("data_analysis", "bulk_email"):
+                config["action"] = "read_rows"
+                config["spreadsheet_id"] = ""
+                config["range"] = "Sheet1!A:Z"
+            else:
+                config["action"] = "append_row"
+
+        elif node_type == "integration_gmail":
+            config["action"] = "send_email"
+
+        elif node_type == "integration_qdrant":
+            config["action"] = "search_vectors"
+            config["top_k"] = 5
+
+        elif node_type == "integration_telegram":
+            config["action"] = "send_message"
+
+        elif node_type.startswith("llm_"):
+            short = prompt[:120] if prompt else "Process this input"
+            config["prompt"] = short
+            config["memory"] = "short_term"
+
+        elif node_type == "loop":
+            config["items_path"] = "items"
+            config["item_alias"] = "item"
+
+        elif node_type == "transform":
+            config["template"] = "{{input}}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 5 — DATA MAPPER  (wires {{node_id.output.field}} bindings)
+# ══════════════════════════════════════════════════════════════════════════
+
+class DataMapper:
+    """
+    Stage 5: Resolves data flow between nodes.
+    - Maps upstream outputs to downstream required inputs
+    - Uses {{node_id.output.field}} binding syntax
+    - Enforces loop semantics: {{item.field}} inside loops
+    - Tracks inferred mappings (triggers -15 confidence penalty)
+    - Can insert an LLM transform node if a required field can't be
+      satisfied directly from upstream outputs
+    """
+
+    def __init__(self) -> None:
+        self.inferred_count: int = 0
+        self.inserted_nodes: int = 0
+
+    def map(self, graph: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+        self.inferred_count = 0
+        self.inserted_nodes = 0
+        nodes = graph["nodes"]
+        wf_type = intent.get("workflow_type", "generic")
+        node_by_type: dict[str, dict[str, Any]] = {}
+        for n in nodes:
+            if n["type"] not in node_by_type:
+                node_by_type[n["type"]] = n
+
+        if wf_type == "data_analysis":
+            self._map_data_analysis(node_by_type)
+        elif wf_type == "rag":
+            self._map_rag(node_by_type)
+        elif wf_type == "bulk_email":
+            self._map_bulk_email(node_by_type)
+        elif wf_type == "chat_automation":
+            self._map_chat_automation(node_by_type)
+        else:
+            self._map_generic(graph)
+
+        return graph
+
+    def _map_data_analysis(self, m: dict[str, dict[str, Any]]) -> None:
+        sheets = m.get("integration_google_sheets")
+        llm = m.get("llm_generate")
+        transform = m.get("transform")
+        if sheets and llm:
+            llm["config"]["input"] = "{{" + sheets["id"] + ".output.rows}}"
+            llm["config"]["prompt"] = "Analyze the following spreadsheet data and provide insights:\n\n{{" + sheets["id"] + ".output.rows}}"
+        if llm and transform:
+            transform["config"]["template"] = "{{" + llm["id"] + ".output.text}}"
+
+    def _map_rag(self, m: dict[str, dict[str, Any]]) -> None:
+        trigger = m.get("trigger_webhook")
+        qdrant = m.get("integration_qdrant")
+        llm = m.get("llm_generate")
+        transform = m.get("transform")
+        if trigger and qdrant:
+            qdrant["config"]["query"] = "{{" + trigger["id"] + ".output.payload.query}}"
+        if qdrant and llm:
+            llm["config"]["input"] = "{{" + qdrant["id"] + ".output.matches}}"
+            llm["config"]["prompt"] = "Answer the question using ONLY the following context:\n\n{{" + qdrant["id"] + ".output.matches}}"
+        if llm and transform:
+            transform["config"]["template"] = "{{" + llm["id"] + ".output.text}}"
+
+    def _map_bulk_email(self, m: dict[str, dict[str, Any]]) -> None:
+        sheets = m.get("integration_google_sheets")
+        loop = m.get("loop")
+        gmail = m.get("integration_gmail")
+        if sheets and loop:
+            loop["config"]["items"] = "{{" + sheets["id"] + ".output.rows}}"
+            loop["config"]["item_alias"] = "item"
+        if gmail:
+            gmail["config"]["to"] = "{{item.email}}"
+            gmail["config"]["subject"] = "{{item.subject}}"
+            gmail["config"]["body"] = "{{item.body}}"
+
+    def _map_chat_automation(self, m: dict[str, dict[str, Any]]) -> None:
+        trigger = m.get("trigger_webhook")
+        llm = m.get("llm_generate")
+        response = m.get("integration_telegram") or m.get("integration_discord") or m.get("integration_slack")
+        if trigger and llm:
+            llm["config"]["input"] = "{{" + trigger["id"] + ".output.payload.text}}"
+            llm["config"]["prompt"] = "You are a helpful assistant. Reply to: {{" + trigger["id"] + ".output.payload.text}}"
+        if llm and response:
+            ntype = response["type"]
+            if ntype == "integration_telegram":
+                response["config"]["text"] = "{{" + llm["id"] + ".output.text}}"
+                response["config"]["chat_id"] = "{{" + (trigger["id"] if trigger else "trigger_webhook_1") + ".output.payload.chat_id}}"
+            elif ntype == "integration_discord":
+                response["config"]["content"] = "{{" + llm["id"] + ".output.text}}"
+            elif ntype == "integration_slack":
+                response["config"]["message"] = "{{" + llm["id"] + ".output.text}}"
+
+    def _map_generic(self, graph: dict[str, Any]) -> None:
+        """Chain generic data flow: infer output→input from upstream schemas.
+        If a downstream required field cannot be satisfied, insert an LLM
+        transform node between the two."""
+        nodes = graph["nodes"]
+        for i, node in enumerate(nodes):
+            if i == 0:
+                continue
+            prev = nodes[i - 1]
+            prev_outputs = NODE_OUTPUT_SCHEMAS.get(prev["type"], [])
+
+            if not prev_outputs:
+                continue
+
+            # Check if downstream has required fields that need satisfaction
+            meta = _NODE_TYPE_MAP.get(node["type"], {})
+            required = meta.get("required_fields", [])
+            config = node.get("config", {})
+            first_field = prev_outputs[0]
+
+            mapped_any = False
+            for field in required:
+                val = config.get(field)
+                if val in (None, "", []) or (isinstance(val, str) and "{{" not in val):
+                    # Try to infer from upstream
+                    if first_field:
+                        config[field] = "{{" + prev["id"] + ".output." + first_field + "}}"
+                        self.inferred_count += 1
+                        mapped_any = True
+
+            # Fallback: at least wire up standard fields
+            if not mapped_any:
+                if node["type"].startswith("llm_"):
+                    config["input"] = "{{" + prev["id"] + ".output." + first_field + "}}"
+                    self.inferred_count += 1
+                elif node["type"] == "transform":
+                    config["template"] = "{{" + prev["id"] + ".output." + first_field + "}}"
+                    self.inferred_count += 1
+
+    def insert_llm_transform(self, graph: dict[str, Any], before_idx: int, source_id: str, source_field: str) -> str:
+        """Insert an LLM transform node into the graph to bridge incompatible data."""
+        node_id = f"llm_transform_{self.inserted_nodes + 1}"
+        self.inserted_nodes += 1
+        llm_node = {
+            "id": node_id,
+            "type": "llm_generate",
+            "name": "LLM Transform",
+            "position": {"x": 100 + before_idx * 280, "y": 450},
+            "config": {
+                "prompt": "Transform the following data for the next step",
+                "input": "{{" + source_id + ".output." + source_field + "}}",
+                "memory": "short_term",
+            },
+            "input_mapping": {},
+            "output_mapping": {},
+            "ai_brain": True,
+            "memory": "short_term",
+            "retry_policy": {"max_retries": 2, "backoff": "exponential", "retry_on": ["timeout", "api_error"]},
+            "timeout_ms": 30000,
+        }
+        graph["nodes"].insert(before_idx, llm_node)
+        return node_id
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 6 — GRAPH OPTIMIZER
+# ══════════════════════════════════════════════════════════════════════════
+
+class GraphOptimizer:
+    """
+    Stage 6: Graph Optimization pass.
+    - Dedupes nodes by type/provider/action
+    - Removes redundant transform nodes
+    - Merges consecutive transforms
+    """
+    def optimize(self, graph: dict[str, Any]) -> dict[str, Any]:
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+
+        # 1. Deduplication pass
+        seen_configs = {}
+        deduped_nodes = []
+        to_remove = set()
+        
+        for n in nodes:
+            # allow duplicate triggers natively clamped by validator if invalid anyway
+            if n["type"].startswith("trigger_"):
+                deduped_nodes.append(n)
+                continue
+            
+            sig = (n["type"], n.get("provider"), n.get("action"), str(n.get("config")))
+            if sig in seen_configs:
+                to_remove.add(n["id"])
+                first_id = seen_configs[sig]
+                for e in edges:
+                    if e["target"] == n["id"]: e["target"] = first_id
+                    if e["source"] == n["id"]: e["source"] = first_id
+            else:
+                seen_configs[sig] = n["id"]
+                deduped_nodes.append(n)
+
+        nodes = deduped_nodes
+        
+        # 2. Redundant map cleanup pass
+        optimized_nodes = []
+        for n in nodes:
+            if n["id"] in to_remove:
+                continue
+            # if transform node only outputs {{input}}, it's a no-op and can be removed
+            if n["type"] == "transform":
+                template = n.get("config", {}).get("template", "")
+                if template == "{{input}}":
+                    to_remove.add(n["id"])
+                    # rewire edges across the removed node
+                    in_edges = [e for e in edges if e["target"] == n["id"]]
+                    out_edges = [e for e in edges if e["source"] == n["id"]]
+                    for ie in in_edges:
+                        for oe in out_edges:
+                            edges.append({
+                                "id": f"edge-{uuid4().hex[:8]}",
+                                "source": ie["source"],
+                                "target": oe["target"],
+                                "condition": "true",
+                            })
+                    edges = [e for e in edges if e["source"] != n["id"] and e["target"] != n["id"]]
+                    continue
+            optimized_nodes.append(n)
+
+        return {"nodes": optimized_nodes, "edges": edges, "applied": len(to_remove) > 0}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 7 — VALIDATOR
+# ══════════════════════════════════════════════════════════════════════════
+
+class Validator:
+    """
+    Stage 7: Enforces structural + semantic correctness.
+    Checks:
+      - Exactly one trigger
+      - No duplicate node IDs
+      - All edges point to valid nodes
+      - No orphan nodes (graph is connected)
+      - Graph is acyclic (no cycles)
+      - Required config fields present and non-empty
+      - Provider-backed nodes exist in NODE_TYPES
+      - Valid data bindings ({{id.output.field}} references real upstream nodes)
+      - Enforces output schema mapping consistency
+      - Execution validation (action inside NODE_TYPES actions)
+      - No empty or non-executable configs
+    """
+
+    def validate(self, graph: dict[str, Any]) -> dict[str, Any]:
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+        issues: list[str] = []
+
+        if not nodes:
+            return {"valid": False, "issues": ["STRUCTURAL: Workflow has no nodes"]}
+
+        node_ids = {n["id"] for n in nodes}
+        node_map = {n["id"]: n for n in nodes}
+
+        # 1. Exactly one trigger
+        trigger_types = {"trigger_webhook", "trigger_schedule"}
+        trigger_like = {"integration_gmail", "integration_stripe", "integration_shopify", "integration_sentry"}
+        triggers = [n for n in nodes if n["type"] in trigger_types or (n["type"] in trigger_like and n is nodes[0])]
+        if len(triggers) == 0:
+            issues.append("STRUCTURAL: No trigger node found")
+        elif len(triggers) > 1:
+            issues.append(f"STRUCTURAL: Multiple triggers found ({len(triggers)}); exactly 1 required")
+        if nodes[0]["type"] not in trigger_types and nodes[0]["type"] not in trigger_like:
+            issues.append(f"STRUCTURAL: First node '{nodes[0]['type']}' is not a valid trigger")
+
+        # 2. No duplicate IDs
+        seen_ids: set[str] = set()
+        for n in nodes:
+            if n["id"] in seen_ids:
+                issues.append(f"STRUCTURAL: Duplicate node ID: {n['id']}")
+            seen_ids.add(n["id"])
+
+        # 3. Edge validity
+        for edge in edges:
+            if edge.get("source") not in node_ids:
+                issues.append(f"STRUCTURAL: Edge {edge['id']} has invalid source: {edge['source']}")
+            if edge.get("target") not in node_ids:
+                issues.append(f"STRUCTURAL: Edge {edge['id']} has invalid target: {edge['target']}")
+
+        # 4. No orphan nodes — every non-first node must be a target of some edge
+        targets = {e["target"] for e in edges}
+        for n in nodes[1:]:
+            if n["id"] not in targets:
+                issues.append(f"STRUCTURAL: Node {n['id']} ({n['name']}) is unreachable (orphan)")
+
+        # 5. Acyclic check — simple DFS cycle detection
+        adjacency: dict[str, list[str]] = {n["id"]: [] for n in nodes}
+        for e in edges:
+            src, tgt = e.get("source"), e.get("target")
+            if src in adjacency and tgt:
+                adjacency[src].append(tgt)
+
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: dict[str, int] = {nid: WHITE for nid in adjacency}
+
+        def _dfs_cycle(nid: str) -> bool:
+            color[nid] = GRAY
+            for nbr in adjacency.get(nid, []):
+                if color.get(nbr) == GRAY:
+                    return True
+                if color.get(nbr) == WHITE and _dfs_cycle(nbr):
+                    return True
+            color[nid] = BLACK
+            return False
+
+        for nid in list(adjacency):
+            if color[nid] == WHITE and _dfs_cycle(nid):
+                issues.append("STRUCTURAL: Cycle detected — graph must be acyclic")
+                break
+
+        # 6. Required config fields & Action validation
+        for n in nodes:
+            meta = _NODE_TYPE_MAP.get(n["type"])
+            if meta is None:
+                issues.append(f"STRUCTURAL: Unknown node type: {n['type']}")
+                continue
+            
+            # Action validation (Execution awareness)
+            action = n.get("action")
+            if action:
+                supported = meta.get("actions", [])
+                if not supported and "default_config" in meta and "action" in meta["default_config"]:
+                    supported = [meta["default_config"]["action"]]
+                if supported and action not in supported:
+                    issues.append(f"EXECUTION: Node {n['id']} uses invalid action '{action}'. Supported: {supported}")
+
+            # Required fields
+            config = n.get("config", {})
+            for field in meta.get("required_fields", []):
+                if field not in config or config[field] in (None, "", []):
+                    issues.append(f"EXECUTION: Node {n['id']} missing required config field: {field}")
+
+        # 7. No empty configs at all
+        for n in nodes:
+            if not n.get("config"):
+                issues.append(f"CONFIG: Node {n['id']} has empty config")
+
+        # 8. Provider validity — provider_slug must be in NODE_TYPES
+        for n in nodes:
+            meta = _NODE_TYPE_MAP.get(n["type"])
+            if meta and meta.get("provider_slug"):
+                # Provider-backed node: type must exist in registry
+                if n["type"] not in _NODE_TYPE_MAP:
+                    issues.append(f"PROVIDER: Node {n['id']} uses unknown provider type: {n['type']}")
+
+        # 9. Binding validation — {{id.output.field}} bindings must reference valid upstream nodes
+        for n in nodes:
+            config = n.get("config", {})
+            for field, val in config.items():
+                if not isinstance(val, str):
+                    continue
+                for binding_match in re.finditer(r"\{\{(\w+)\.output\.(\w+)\}\}", val):
+                    ref_id = binding_match.group(1)
+                    # Skip loop item references
+                    if ref_id == "item":
+                        continue
+                    # The referenced node must exist in the graph
+                    ref_node = next((upstream for upstream in nodes if ref_id in upstream["id"]), None)
+                    if not ref_node:
+                        issues.append(f"BINDING: Node {n['id']}.{field} references unknown node: {ref_id}")
+                    else:
+                        # Validate output schema compatibility
+                        schemas = NODE_OUTPUT_SCHEMAS.get(ref_node["type"], [])
+                        ref_field = binding_match.group(2)
+                        if schemas and ref_field not in schemas:
+                            issues.append(f"BINDING: Node {n['id']}.{field} uses invalid output '{ref_field}' from '{ref_node['type']}'. Valid: {schemas}")
+
+        return {"valid": len(issues) == 0, "issues": issues}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAGE 7 — CONFIDENCE SCORER  (deterministic 0–100 rubric)
+# ══════════════════════════════════════════════════════════════════════════
+
+class ConfidenceScorer:
+    """
+    Stage 7: Deterministic scoring rubric.
+      Start at 100, subtract:
+        -30  missing integrations (provider not connected)
+        -20  unclear or unsupported pattern
+        -15  fallback intent extraction (LLM unavailable)
+        -15  inferred mappings (DataMapper had to guess)
+        -10  extra compiler-inserted nodes
+      Clamp to [0, 100].
+    """
+
+    def score(
+        self,
+        intent: dict[str, Any],
+        pattern: dict[str, Any],
+        tool_selection: dict[str, Any],
+        validation: dict[str, Any],
+        graph: dict[str, Any],
+        data_mapper: DataMapper | None = None,
+    ) -> dict[str, Any]:
+        score = 100
+        penalties: list[str] = []
+
+        # -30: Missing integrations
+        if tool_selection.get("missing_integrations"):
+            score -= 30
+            penalties.append(f"-30: missing integrations ({', '.join(tool_selection['missing_integrations'])})")
+
+        # -20: Unclear / unsupported pattern
+        if not pattern.get("is_supported") or pattern.get("matched_type") == "generic":
+            score -= 20
+            penalties.append("-20: unclear or unsupported pattern")
+
+        # -15: Regex fallback (LLM parsing failed)
+        if intent.get("_source") == "regex_fallback":
+            score -= 15
+            penalties.append("-15: fallback intent extraction (LLM unavailable)")
+
+        # -15: Inferred mappings (DataMapper had to guess bindings)
+        inferred = data_mapper.inferred_count if data_mapper else 0
+        if inferred > 0:
+            score -= 15
+            penalties.append(f"-15: {inferred} inferred mapping(s)")
+
+        # -10: Extra compiler-inserted nodes
+        canonical = CANONICAL_PATTERNS.get(pattern.get("matched_type", ""), {})
+        expected_count = len(canonical.get("roles", []))
+        actual_count = len(graph.get("nodes", []))
+        inserted = (data_mapper.inserted_nodes if data_mapper else 0)
+        extra = (actual_count - expected_count) if expected_count > 0 else 0
+        extra += inserted
+        if extra > 0:
+            score -= 10
+            penalties.append(f"-10: {extra} extra node(s)")
+
+        score = max(0, min(100, score))
+
+        return {
+            "total": score,
+            "penalties": penalties,
+            "breakdown": {
+                "base": 100,
+                "missing_integrations": -30 if tool_selection.get("missing_integrations") else 0,
+                "pattern_support": -20 if (not pattern.get("is_supported") or pattern.get("matched_type") == "generic") else 0,
+                "fallback_extraction": -15 if intent.get("_source") == "regex_fallback" else 0,
+                "inferred_mappings": -15 if inferred > 0 else 0,
+                "extra_nodes": -10 if extra > 0 else 0,
+            },
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ORCHESTRATOR — dual-mode compiler + code graph engine
+# ══════════════════════════════════════════════════════════════════════════
+
+class AuraFlowWorkflowArchitect:
+    """
+    AuraFlow system orchestrator.
+
+    Mode 1 — WORKFLOW:
+      1. IntentExtractor   → structured intent JSON (LLM + regex fallback)
+      2. PatternMatcher    → canonical workflow pattern (5 templates)
+      3. ToolSelector      → validated tool list (NODE_TYPES + integrations)
+      4. GraphCompiler     → minimal node/edge graph (deterministic IDs)
+      5. DataMapper        → {{binding}} wiring (with loop semantics)
+      6. GraphOptimizer    → redundant node cleanup
+      7. Validator         → structural + semantic + execution checks
+      8. ConfidenceScorer  → 0-100 deterministic rubric
+
+    Mode 2 — CODE:
+      MCP code graph query → relevant services, files, relationships
+    """
+
+    def __init__(self) -> None:
+        self.mode_router = ModeRouter()
+        self.code_graph = CodeGraphEngine()
+        self.inputs_resolver = CompilerInputsResolver()
+        self.intent_extractor = IntentExtractor()
+        self.pattern_matcher = PatternMatcher()
+        self.tool_selector = ToolSelector()
+        self.graph_compiler = GraphCompiler()
+        self.graph_optimizer = GraphOptimizer()
+        self.validator = Validator()
+        self.confidence_scorer = ConfidenceScorer()
 
     def generate(self, description: str) -> dict[str, Any]:
-        desc = description.strip()
-        if not desc:
+        prompt = description.strip()
+        if not prompt:
             raise ValueError("Prompt is required.")
 
-        # Stage 1: Parse
-        parsed = self.parser.parse(desc)
+        # ── Mode Decision ─────────────────────────────────────────────
+        mode, mode_scores = self.mode_router.route(prompt)
 
-        # Check if clarification needed
-        if parsed["confidence"] < 0.3 and parsed.get("ambiguity_flags"):
-            raise ValueError("clarification_required")
+        if mode == "code":
+            return self._handle_code_mode(prompt)
 
-        # Stage 2: Plan
-        plan = self.planner.plan(desc, parsed)
+        return self._handle_workflow_mode(prompt, mode_scores)
 
-        # Stage 3: Build
-        result = self.builder.build(desc, plan)
+    # ── CODE MODE ─────────────────────────────────────────────────────
 
-        # Return with all confidence data
+    def _handle_code_mode(self, prompt: str) -> dict[str, Any]:
+        return self.code_graph.query(prompt)
+
+    # ── WORKFLOW MODE ─────────────────────────────────────────────────
+
+    def _handle_workflow_mode(self, prompt: str, mode_scores: dict[str, int]) -> dict[str, Any]:
+        # ── Stage 0: Resolve global compiler inputs ───────────────────
+        compiler_inputs = self.inputs_resolver.resolve()
+
+        # ── Stage 1: Intent Extraction (LLM → regex fallback) ─────────
+        intent = self.intent_extractor.extract(prompt)
+
+        # ── Stage 2: Pattern Matching (5 canonical templates) ─────────
+        pattern = self.pattern_matcher.match(intent)
+
+        # ── Stage 3: Tool Selection (strict registry-based) ──────────
+        tool_selection = self.tool_selector.select(pattern)
+
+        # Reject completely unsupported patterns
+        if not tool_selection["is_supported"] and not tool_selection["selected_tools"]:
+            raise ValueError(
+                f"Unsupported workflow pattern: {pattern.get('matched_type')}. "
+                f"Reason: {pattern.get('unsupported_reason', 'required tools not available')}"
+            )
+
+        # ── Compilation with Double Validation / Retry Loop ───────────
+        attempts_taken = 0
+        graph: dict[str, Any] = {}
+        validation: dict[str, Any] = {"valid": False, "issues": []}
+        data_mapper = DataMapper()
+        optimization_applied = False
+
+        for attempt in range(2):
+            attempts_taken += 1
+
+            # ── Stage 4: Graph Compilation (deterministic) ────────────────
+            graph = self.graph_compiler.compile(intent, tool_selection)
+
+            # ── Stage 5: Data Mapping (with loop semantics) ──────────────
+            data_mapper = DataMapper()
+            graph = data_mapper.map(graph, intent)
+
+            # ── Stage 6a: Validator (PASS 1 - Before Optimization) ───────
+            pass1_validation = self.validator.validate(graph)
+            if not pass1_validation["valid"]:
+                validation = pass1_validation
+
+            # ── Stage 6b: Graph Optimization ──────────────────────────────
+            opt_result = self.graph_optimizer.optimize(graph)
+            graph = {"nodes": opt_result["nodes"], "edges": opt_result["edges"]}
+            optimization_applied = opt_result.get("applied", False)
+
+            # ── Stage 7: Validation (PASS 2 - Final Structural State) ─────
+            validation = self.validator.validate(graph)
+
+            if validation["valid"]:
+                break
+
+        # ── Stage 8: Confidence Scoring (exact rubric) ────────────────
+        confidence = self.confidence_scorer.score(
+            intent, pattern, tool_selection, validation, graph, data_mapper,
+        )
+        normalized = confidence["total"] / 100.0
+
+        # ── Build workflow name ───────────────────────────────────────
+        name = pattern.get("name", "Generated Workflow")
+        matched_type = pattern.get("matched_type", "generic")
+
+        # ── Count bindings ────────────────────────────────────────────
+        binding_count = sum(
+            1 for n in graph["nodes"]
+            for v in (n.get("config") or {}).values()
+            if isinstance(v, str) and "{{" in v
+        )
+
+        # ── Assemble response ─────────────────────────────────────────
+        result: dict[str, Any] = {
+            # Mode identifier
+            "mode": "workflow",
+
+            # ── Backward-compatible top-level shape for existing editor ──
+            "name": name,
+            "nodes": graph["nodes"],
+            "edges": graph["edges"],
+            "explanation": (
+                f"Compiled {len(graph['nodes'])}-node {name} workflow. "
+                f"Pattern: {matched_type}. "
+                f"Confidence: {confidence['total']}%."
+            ),
+            "missing_integrations": tool_selection["missing_integrations"],
+            "confidence": normalized,
+            "needs_confirmation": confidence["total"] < 60,
+            "plan_confidence": normalized,
+            "parse_confidence": normalized,
+
+            # ── Strict compiler metadata ─────────────────────────────────
+            "pattern": matched_type,
+            "intent": {
+                "workflow_type": intent.get("workflow_type"),
+                "input_mode": intent.get("input_mode"),
+                "requires_llm": intent.get("requires_llm"),
+                "requires_loop": intent.get("requires_loop"),
+                "target_integrations": intent.get("target_integrations"),
+                "_source": intent.get("_source"),
+            },
+            "workflow": {
+                "nodes": graph["nodes"],
+                "edges": graph["edges"],
+            },
+            "confidence_detail": confidence,
+            "debug": {
+                "mode_scores": mode_scores,
+                "inferred_mappings": data_mapper.inferred_count,
+                "pattern_confidence": "high" if confidence["total"] > 80 else "low",
+                "validation_errors": validation.get("issues", []),
+                "retry_attempts": attempts_taken,
+                "inserted_nodes": data_mapper.inserted_nodes,
+                "optimization_applied": optimization_applied
+            }
+        }
+
+        if not validation["valid"]:
+            result["validation_issues"] = validation["issues"]
+
+        # Reasoning block for debugging
+        result["reasoning"] = {
+            "intent_source": intent.get("_source"),
+            "pattern_matched": matched_type,
+            "tools_selected": len(tool_selection["selected_tools"]),
+            "tools_missing": tool_selection["missing_integrations"],
+            "node_count": len(graph["nodes"]),
+            "edge_count": len(graph["edges"]),
+            "binding_count": binding_count,
+            "inferred_mappings": data_mapper.inferred_count,
+            "inserted_nodes": data_mapper.inserted_nodes,
+            "validation": validation,
+            "confidence_breakdown": confidence["breakdown"],
+        }
+
         return result
 
 

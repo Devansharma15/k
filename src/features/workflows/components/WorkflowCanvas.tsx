@@ -71,7 +71,7 @@ export function WorkflowCanvas({
 
   const initialNodes = useMemo<Node[]>(
     () =>
-      snapshot.nodes.map((node) => {
+      (snapshot?.nodes || []).map((node) => {
         const catalog = nodeTypesCatalog.find((item) => item.type === node.type);
         return {
           id: node.id,
@@ -82,9 +82,9 @@ export function WorkflowCanvas({
             label: catalog?.label ?? node.name,
             family: catalog?.family ?? "core",
             summary:
-              typeof node.config.prompt === "string"
+              typeof node.config?.prompt === "string"
                 ? node.config.prompt
-                : typeof node.config.expression === "string"
+                : typeof node.config?.expression === "string"
                   ? node.config.expression
                   : `${node.name} configuration`,
             status: nodeStatuses[node.id] ?? "idle",
@@ -92,12 +92,12 @@ export function WorkflowCanvas({
           },
         };
       }),
-    [snapshot.nodes, nodeTypesCatalog, nodeStatuses, nodeWarnings],
+    [snapshot?.nodes, nodeTypesCatalog, nodeStatuses, nodeWarnings],
   );
 
   const initialEdges = useMemo<Edge[]>(
     () =>
-      snapshot.edges.map((edge) => ({
+      (snapshot?.edges || []).map((edge) => ({
         id: edge.id,
         source: edge.source,
         target: edge.target,
@@ -105,7 +105,7 @@ export function WorkflowCanvas({
         animated: edge.condition === "true",
         style: { strokeWidth: 2 },
       })),
-    [snapshot.edges],
+    [snapshot?.edges],
   );
 
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -115,13 +115,15 @@ export function WorkflowCanvas({
 
   // Sync prop changes -> local state (only if changed from outside)
   useEffect(() => {
-    const snapshotStr = JSON.stringify({ nodes: snapshot.nodes, edges: snapshot.edges });
+    const safeNodes = snapshot?.nodes || [];
+    const safeEdges = snapshot?.edges || [];
+    const snapshotStr = JSON.stringify({ nodes: safeNodes, edges: safeEdges });
     if (snapshotStr !== lastSyncedSnapshotRef.current) {
       setNodes(initialNodes);
       setEdges(initialEdges);
       lastSyncedSnapshotRef.current = snapshotStr;
     }
-  }, [initialNodes, initialEdges, snapshot.nodes, snapshot.edges, setNodes, setEdges]);
+  }, [initialNodes, initialEdges, snapshot?.nodes, snapshot?.edges, setNodes, setEdges]);
 
   // Sync internal changes -> parent state
   useEffect(() => {
@@ -178,12 +180,31 @@ export function WorkflowCanvas({
   const onConnect = useCallback(
     (params: Connection) => {
       if (!isEditable) return;
-      const newEdge = {
+      
+      let label = "true";
+      let strokeColor = "inherit";
+      
+      if (params.sourceHandle === "true") {
+        label = "Yes";
+        strokeColor = "#10b981"; // Emerald
+      } else if (params.sourceHandle === "false") {
+        label = "No";
+        strokeColor = "#f43f5e"; // Rose
+      }
+
+      if (!params.source || !params.target) return;
+
+      const newEdge: Edge = {
         ...params,
+        source: params.source,
+        target: params.target,
         id: `edge-${crypto.randomUUID()}`,
-        label: "true",
+        label,
         animated: true,
-        style: { strokeWidth: 2 },
+        style: { strokeWidth: 2, stroke: strokeColor },
+        labelStyle: { fill: strokeColor, fontWeight: 700, fontSize: 13 },
+        labelBgStyle: { fill: "rgba(2, 6, 23, 0.8)", rx: 4, ry: 4 },
+        labelBgPadding: [4, 4],
       };
       
       setEdges((currentEdges) => {
@@ -299,7 +320,9 @@ export function WorkflowCanvas({
         className="bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.04),_transparent_40%),linear-gradient(180deg,rgba(2,6,23,0.55),rgba(2,6,23,0.9))]"
       >
         <Background color="#334155" gap={24} variant={BackgroundVariant.Dots} />
-        <Controls className="border border-border bg-card fill-foreground" />
+        <Controls 
+          className="overflow-hidden rounded-xl border border-border bg-card shadow-lg [&_button]:!border-b-border [&_button]:!bg-card [&_button]:!fill-muted-foreground hover:[&_button]:!bg-accent hover:[&_button]:!fill-foreground" 
+        />
         <MiniMap
           className="overflow-hidden rounded-xl border border-border bg-card"
           maskColor="rgba(2, 6, 23, 0.55)"
@@ -318,10 +341,10 @@ export function WorkflowCanvas({
         <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center">
           <div className="glass max-w-md rounded-2xl border border-border px-6 py-5 text-center">
             <p className="text-base font-semibold text-foreground">
-              Drag nodes or generate with AI
+              Add your first node
             </p>
             <p className="mt-2 text-sm text-muted-foreground">
-              Open the palette and drop nodes on the canvas, or use the prompt bar to generate a workflow.
+              Open the palette on the left and drop nodes onto the canvas to start building your workflow.
             </p>
           </div>
         </div>

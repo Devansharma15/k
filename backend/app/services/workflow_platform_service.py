@@ -1158,8 +1158,6 @@ class WorkflowPlatformService:
         nodes = snapshot.get("nodes", [])
         edges = snapshot.get("edges", [])
         node_ids = {node.get("id") for node in nodes}
-        if not nodes:
-            raise ValueError("Workflow must include at least one node.")
         # Enforce workflow limits
         self._enforce_limits_on_snapshot(snapshot)
         node_type_map = {item["type"]: item for item in NODE_TYPES}
@@ -1218,6 +1216,8 @@ class WorkflowPlatformService:
         self._assert_workflow_unlocked(workflow_id)
         workflow = self.get_workflow(workflow_id)
         snapshot = workflow["draft_snapshot"]
+        if not snapshot.get("nodes"):
+            raise ValueError("Workflow must include at least one node before it can be published.")
         validation = self.validate_snapshot(snapshot)
         if validation["errors"]:
             first = validation["errors"][0]
@@ -1434,6 +1434,10 @@ class WorkflowPlatformService:
 
         workflow = self.get_workflow(workflow_id)
         snapshot, workflow_version_id = self._resolve_snapshot_for_run(workflow, mode, version_id)
+        
+        if not snapshot.get("nodes"):
+            raise ValueError("Workflow must include at least one node to run.")
+            
         validation = self.validate_snapshot(snapshot)
         if validation["errors"]:
             first = validation["errors"][0]

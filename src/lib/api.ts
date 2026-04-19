@@ -358,12 +358,26 @@ export interface AutosaveDraft {
 }
 
 export interface GeneratedWorkflowResponse extends WorkflowDefinition {
+  mode?: 'workflow' | 'code';
   explanation?: string;
   missing_integrations?: string[];
   confidence?: number;
   needs_confirmation?: boolean;
   plan_confidence?: number;
   parse_confidence?: number;
+  pattern?: string;
+  intent?: Record<string, unknown>;
+  workflow?: WorkflowDefinition;
+  confidence_detail?: {
+    total: number;
+    penalties: string[];
+    breakdown: Record<string, number>;
+  };
+  validation_issues?: string[];
+  reasoning?: Record<string, unknown>;
+  // Code mode fields (returned when mode === 'code')
+  relevant_nodes?: Array<Record<string, unknown>>;
+  relationships?: string[];
 }
 
 export interface VersionComparisonResult {
