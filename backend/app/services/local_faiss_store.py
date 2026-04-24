@@ -141,9 +141,6 @@ class FaissSimpleStore:
         if not self.data:
             return []
 
-        import faiss
-        index = faiss.IndexFlatL2(self.dimension)
-        
         # Filter first
         candidates = []
         for k, v in self.data.items():
@@ -155,7 +152,6 @@ class FaissSimpleStore:
         if not candidates:
             return []
             
-        # Build index
         candidate_ids = []
         vecs = []
         for c_id, c_vec, c_payload in candidates:
@@ -163,18 +159,26 @@ class FaissSimpleStore:
             vecs.append(c_vec)
             
         vec_arr = np.array(vecs, dtype=np.float32)
-        index.add(vec_arr)
+        q_arr = np.array(query_vector, dtype=np.float32)
         
-        q_arr = np.array([query_vector], dtype=np.float32)
-        distances, indices = index.search(q_arr, min(top_k, len(candidates)))
+        # Calculate L2 squared distances (pure numpy)
+        diff = vec_arr - q_arr
+        distances = np.sum(diff**2, axis=-1)
+        
+        k = min(top_k, len(candidates))
+        if k < len(candidates):
+            indices = np.argpartition(distances, k)[:k]
+            top_k_indices = indices[np.argsort(distances[indices])]
+        else:
+            top_k_indices = np.argsort(distances)
         
         results = []
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx != -1:
-                point_id, payload = candidate_ids[idx]
-                results.append({
-                    "id": point_id,
-                    "score": float(1.0 / (1.0 + dist)),  # L2 inverted roughly mapping to similarity
-                    "payload": payload
-                })
+        for idx in top_k_indices:
+            dist = distances[idx]
+            point_id, payload = candidate_ids[idx]
+            results.append({
+                "id": point_id,
+                "score": float(1.0 / (1.0 + dist)),  # L2 inverted roughly mapping to similarity
+                "payload": payload
+            })
         return results

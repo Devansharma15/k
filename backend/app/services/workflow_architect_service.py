@@ -500,34 +500,7 @@ class IntentExtractor:
     # ── LLM path ──────────────────────────────────────────────────────
 
     def _try_llm_extract(self, prompt: str) -> dict[str, Any] | None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            # Also try Gemini
-            return self._try_gemini_extract(prompt)
-        try:
-            payload = {
-                "model": os.getenv("OPENAI_WORKFLOW_MODEL", "gpt-4.1-mini"),
-                "messages": [
-                    {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.0,
-            }
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            text = body["choices"][0]["message"]["content"]
-            return self._parse_llm_json(text)
-        except Exception:
-            return self._try_gemini_extract(prompt)
+        return self._try_gemini_extract(prompt)
 
     def _try_gemini_extract(self, prompt: str) -> dict[str, Any] | None:
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")

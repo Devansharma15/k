@@ -1896,50 +1896,17 @@ class WorkflowPlatformService:
         node_input: dict[str, Any],
         memory_mode: str,
     ) -> dict[str, Any]:
-        provider = self._route_llm(prompt, node_input)
-        if provider == "gemini":
-            text = self._call_gemini(prompt, node_input, memory_mode)
-            model = "gemini-2.0-flash"
-        else:
-            text = self._call_openai(prompt, node_input, memory_mode)
-            model = "gpt-4.1-mini"
+        text = self._call_gemini(prompt, node_input, memory_mode)
+        model = "gemini-2.0-flash"
         tokens_used = max(32, len(prompt) + len(json.dumps(node_input)))
         return {
             "model": model,
-            "provider": provider,
+            "provider": "gemini",
             "memory": memory_mode,
             "text": text,
             "tokens_used": tokens_used,
             "cost": round(tokens_used * 0.000002, 6),
         }
-
-    def _route_llm(self, prompt: str, node_input: dict[str, Any]) -> str:
-        complexity = len(prompt.split()) + len(json.dumps(node_input))
-        return "gemini" if complexity > 500 else "openai"
-
-    def _call_openai(self, prompt: str, node_input: dict[str, Any], memory_mode: str) -> str:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY is not configured.")
-        payload = {
-            "model": os.getenv("OPENAI_WORKFLOW_MODEL", "gpt-4.1-mini"),
-            "messages": [
-                {"role": "system", "content": f"You are AuraFlow. Memory mode: {memory_mode}."},
-                {"role": "user", "content": f"{prompt}\n\nInput:\n{json.dumps(node_input)}"},
-            ],
-        }
-        request = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=60) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        return body["choices"][0]["message"]["content"]
 
     def _call_gemini(self, prompt: str, node_input: dict[str, Any], memory_mode: str) -> str:
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")

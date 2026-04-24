@@ -14,7 +14,7 @@ class ChatRequest(BaseModel):
     dataset_id: str = "dataset_default"
 
 import os
-from openai import AsyncOpenAI
+import google.generativeai as genai
 
 PROMPT_TEMPLATE = """You are a strict retrieval-based assistant.
 Answer the question ONLY using the provided context.
@@ -52,24 +52,24 @@ Supporting Evidence:
 - <key point from context>"""
 
 async def stream_rag_response(question: str, context: str):
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        yield json.dumps({"token": "Error: OPENAI_API_KEY not found in environment. Raw context retrieved:\n\n" + context})
+        yield json.dumps({"token": "Error: GEMINI_API_KEY not found in environment. Raw context retrieved:\n\n" + context})
         return
 
-    client = AsyncOpenAI(api_key=api_key)
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.0-flash")
     prompt = PROMPT_TEMPLATE.format(context=context if context else "[NO CONTEXT FOUND]", question=question)
 
     try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
+        response = await model.generate_content_async(
+            prompt,
             stream=True,
-            temperature=0.0
+            generation_config={"temperature": 0.0}
         )
         async for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield json.dumps({"token": chunk.choices[0].delta.content})
+            if chunk.text:
+                yield json.dumps({"token": chunk.text})
     except Exception as e:
         yield json.dumps({"token": f"\n\n[LLM Error: {str(e)}]"})
 
